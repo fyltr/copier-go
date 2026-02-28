@@ -89,6 +89,9 @@ func IsGitURL(url string) bool {
 
 // CloneTemplate clones a git template to a temporary directory and checks out the
 // specified ref. If ref is empty, the latest semver tag is used.
+//
+// Uses the git CLI for cloning so that SSH keys, credential helpers, and
+// other user-configured auth mechanisms work transparently.
 func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, resolvedRef string, err error) {
 	url, _ = NormalizeURL(url)
 
@@ -97,13 +100,19 @@ func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, reso
 		return "", "", fmt.Errorf("creating temp dir: %w", err)
 	}
 
-	repo, err := git.PlainClone(tmpDir, false, &git.CloneOptions{
-		URL:      url,
-		NoCheckout: true,
-	})
+	// Clone via CLI to inherit the user's SSH keys / credential helpers.
+	cloneArgs := []string{"clone", "--no-checkout", url, tmpDir}
+	cmd := exec.Command("git", cloneArgs...)
+	if out, cloneErr := cmd.CombinedOutput(); cloneErr != nil {
+		os.RemoveAll(tmpDir)
+		return "", "", fmt.Errorf("cloning %s: %s: %w", url, strings.TrimSpace(string(out)), cloneErr)
+	}
+
+	// Open the cloned repo with go-git for tag/ref resolution.
+	repo, err := git.PlainOpen(tmpDir)
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		return "", "", fmt.Errorf("cloning %s: %w", url, err)
+		return "", "", fmt.Errorf("opening cloned repo: %w", err)
 	}
 
 	if ref == "" {
@@ -117,8 +126,13 @@ func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, reso
 
 	if ref != "" {
 		if err := checkoutRef(repo, ref); err != nil {
-			os.RemoveAll(tmpDir)
-			return "", "", fmt.Errorf("checkout %s: %w", ref, err)
+			// Fallback: try CLI checkout (handles annotated tags, etc.).
+			coCmd := exec.Command("git", "checkout", ref)
+			coCmd.Dir = tmpDir
+			if out, coErr := coCmd.CombinedOutput(); coErr != nil {
+				os.RemoveAll(tmpDir)
+				return "", "", fmt.Errorf("checkout %s: %s: %w", ref, strings.TrimSpace(string(out)), coErr)
+			}
 		}
 	} else {
 		// Checkout HEAD.

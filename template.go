@@ -46,7 +46,7 @@ type TemplateConfig struct {
 	SecretQuestions  []string   `yaml:"_secret_questions"`
 	PreserveSymlinks bool       `yaml:"_preserve_symlinks"`
 	MinCopierVersion string     `yaml:"_min_copier_version"`
-	Envops           map[string]any `yaml:"_envops"`
+	Envops           Envops         `yaml:"_envops"`
 
 	MessageBeforeCopy   string `yaml:"_message_before_copy"`
 	MessageAfterCopy    string `yaml:"_message_after_copy"`

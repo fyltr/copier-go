@@ -252,7 +252,7 @@ func (w *worker) applyUpdate(srcPath, oldRef string) error {
 		cfg:      Config{SrcPath: srcPath, DstPath: oldDir, Quiet: true, SkipTasks: true},
 		tmpl:     oldTmpl,
 		answers:  w.answers,
-		renderer: NewRenderer(w.answers.Combined(), oldTmpl.CopyRoot()),
+		renderer: NewRenderer(w.answers.Combined(), oldTmpl.CopyRoot(), w.resolveEnvops()),
 		settings: w.settings,
 		phase:    PhaseRender,
 		logger:   w.logger,
@@ -349,7 +349,7 @@ func (w *worker) initRenderer() {
 		}
 	}
 	ctx["_folder_name"] = filepath.Base(w.cfg.DstPath)
-	w.renderer = NewRenderer(ctx, tmplDir)
+	w.renderer = NewRenderer(ctx, tmplDir, w.resolveEnvops())
 }
 
 func (w *worker) askQuestions() error {
@@ -695,6 +695,34 @@ func (w *worker) printMessage(msg string) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, rendered)
+}
+
+func (w *worker) resolveEnvops() Envops {
+	if w.tmpl == nil {
+		return DefaultEnvops()
+	}
+	eo := w.tmpl.Config.Envops
+	d := DefaultEnvops()
+	// Fill in any unset fields with defaults.
+	if eo.BlockStartString == "" {
+		eo.BlockStartString = d.BlockStartString
+	}
+	if eo.BlockEndString == "" {
+		eo.BlockEndString = d.BlockEndString
+	}
+	if eo.VariableStartString == "" {
+		eo.VariableStartString = d.VariableStartString
+	}
+	if eo.VariableEndString == "" {
+		eo.VariableEndString = d.VariableEndString
+	}
+	if eo.CommentStartString == "" {
+		eo.CommentStartString = d.CommentStartString
+	}
+	if eo.CommentEndString == "" {
+		eo.CommentEndString = d.CommentEndString
+	}
+	return eo
 }
 
 func dirExists(path string) bool {
