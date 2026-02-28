@@ -1,2 +1,0 @@
-_skip_if_exists:
-  - "a.noeof.txt"

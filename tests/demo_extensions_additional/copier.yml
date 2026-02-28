@@ -1,3 +1,0 @@
-_jinja_extensions:
-  - tests.test_jinja2_extensions.FilterExtension
-  - tests.test_jinja2_extensions.GlobalsExtension
