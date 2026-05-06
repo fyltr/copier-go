@@ -17,7 +17,7 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", src, err)
 	}
-	defer srcFile.Close()
+	defer func() { _ = srcFile.Close() }()
 
 	info, err := srcFile.Stat()
 	if err != nil {
@@ -32,10 +32,13 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("creating %s: %w", dst, err)
 	}
-	defer dstFile.Close()
+	defer func() { _ = dstFile.Close() }()
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return fmt.Errorf("copying to %s: %w", dst, err)
+	}
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("setting permissions on %s: %w", dst, err)
 	}
 	return nil
 }
@@ -144,7 +147,7 @@ func WriteAnswersFile(path string, answers map[string]any, metadata map[string]a
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Write header comment.
 	if _, err := fmt.Fprintln(f, "# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY"); err != nil {

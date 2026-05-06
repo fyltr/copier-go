@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/fyltr/copier-go/internal/pathutil"
 	"github.com/fyltr/copier-go/internal/version"
 )
 
@@ -51,6 +52,7 @@ func (w *worker) runCopy() error {
 		return err
 	}
 	w.tmpl = tmpl
+	defer tmpl.Cleanup()
 
 	if err := w.checkVersion(); err != nil {
 		return err
@@ -74,7 +76,9 @@ func (w *worker) runCopy() error {
 		w.answers.UserDefaults[k] = v
 	}
 
-	w.initRenderer()
+	if err := w.initRenderer(); err != nil {
+		return err
+	}
 
 	// Prompt phase.
 	w.phase = PhasePrompt
@@ -83,18 +87,17 @@ func (w *worker) runCopy() error {
 	}
 
 	// Refresh renderer with complete answers.
-	w.initRenderer()
+	if err := w.initRenderer(); err != nil {
+		return err
+	}
 
 	// Render phase.
 	w.phase = PhaseRender
-	dstCreated := false
-	if !dirExists(w.cfg.DstPath) {
-		dstCreated = true
-	}
+	dstCreated := !dirExists(w.cfg.DstPath)
 
 	if err := w.renderTemplate(); err != nil {
 		if dstCreated && w.cfg.CleanupOnError && !w.cfg.Pretend {
-			os.RemoveAll(w.cfg.DstPath)
+			_ = os.RemoveAll(w.cfg.DstPath)
 		}
 		return err
 	}
@@ -145,6 +148,7 @@ func (w *worker) runUpdate() error {
 	if srcPath == "" {
 		return fmt.Errorf("cannot determine template source; provide --src or ensure _src_path in answers")
 	}
+	srcPath = resolveStoredSourcePath(srcPath, w.cfg.DstPath)
 
 	// Determine old ref from previous answers.
 	oldRef := ""
@@ -158,6 +162,7 @@ func (w *worker) runUpdate() error {
 		return err
 	}
 	w.tmpl = newTmpl
+	defer newTmpl.Cleanup()
 
 	if err := w.checkVersion(); err != nil {
 		return err
@@ -178,14 +183,18 @@ func (w *worker) runUpdate() error {
 		w.answers.UserDefaults[k] = v
 	}
 
-	w.initRenderer()
+	if err := w.initRenderer(); err != nil {
+		return err
+	}
 
 	// Prompt phase.
 	w.phase = PhasePrompt
 	if err := w.askQuestions(); err != nil {
 		return err
 	}
-	w.initRenderer()
+	if err := w.initRenderer(); err != nil {
+		return err
+	}
 
 	// Render phase — 3-way merge.
 	w.phase = PhaseRender
@@ -234,18 +243,19 @@ func (w *worker) applyUpdate(srcPath, oldRef string) error {
 	if err != nil {
 		return fmt.Errorf("loading old template version: %w", err)
 	}
+	defer oldTmpl.Cleanup()
 
 	oldDir, err := os.MkdirTemp("", "copier-old-*")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(oldDir)
+	defer func() { _ = os.RemoveAll(oldDir) }()
 
 	newDir, err := os.MkdirTemp("", "copier-new-*")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(newDir)
+	defer func() { _ = os.RemoveAll(newDir) }()
 
 	// Render old template.
 	oldWorker := &worker{
@@ -332,13 +342,15 @@ func (w *worker) threeWayMerge(oldDir, newDir string) error {
 	return nil
 }
 
-func (w *worker) initRenderer() {
+func (w *worker) initRenderer() error {
 	tmplDir := ""
 	if w.tmpl != nil {
 		tmplDir = w.tmpl.CopyRoot()
 	}
 	ctx := w.answers.Combined()
 	ctx["_copier_phase"] = string(w.phase)
+	ctx["_copier_operation"] = string(w.operation)
+	ctx["_external_data"] = map[string]any{}
 	if w.tmpl != nil {
 		ctx["_copier_conf"] = map[string]any{
 			"src_path":     w.tmpl.URL,
@@ -346,10 +358,20 @@ func (w *worker) initRenderer() {
 			"answers_file": w.cfg.AnswersFile,
 			"vcs_ref":      w.tmpl.Ref,
 			"vcs_ref_hash": w.tmpl.CommitHash,
+			"sep":          string(filepath.Separator),
 		}
 	}
 	ctx["_folder_name"] = filepath.Base(w.cfg.DstPath)
-	w.renderer = NewRenderer(ctx, tmplDir, w.resolveEnvops())
+	eo := w.resolveEnvops()
+	if w.tmpl != nil && len(w.tmpl.Config.ExternalData) > 0 {
+		external, err := w.loadExternalData(ctx, tmplDir, eo)
+		if err != nil {
+			return err
+		}
+		ctx["_external_data"] = external
+	}
+	w.renderer = NewRenderer(ctx, tmplDir, eo)
+	return nil
 }
 
 func (w *worker) askQuestions() error {
@@ -384,14 +406,18 @@ func (w *worker) askQuestions() error {
 				return &QuestionError{Name: q.Name, Err: err}
 			}
 			w.answers.User[q.Name] = parsed
-			w.initRenderer()
+			if err := w.initRenderer(); err != nil {
+				return err
+			}
 			continue
 		}
 
 		// Also use default if data was provided via CLI.
 		if _, ok := w.answers.Init[q.Name]; ok {
 			w.answers.User[q.Name] = w.answers.Init[q.Name]
-			w.initRenderer()
+			if err := w.initRenderer(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -413,7 +439,9 @@ func (w *worker) askQuestions() error {
 		}
 
 		// Re-init renderer so subsequent questions can reference this answer.
-		w.initRenderer()
+		if err := w.initRenderer(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -436,7 +464,10 @@ func (w *worker) renderTemplate() error {
 			if renderedRel == "" {
 				continue
 			}
-			dstPath := filepath.Join(w.cfg.DstPath, renderedRel)
+			dstPath, err := safeJoin(w.cfg.DstPath, renderedRel)
+			if err != nil {
+				return err
+			}
 
 			if d.IsDir() {
 				if !w.cfg.Pretend {
@@ -503,6 +534,12 @@ func (w *worker) renderFile(srcPath, dstPath, relPath string, isTemplate bool) e
 		return err
 	}
 
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return err
+	}
+	srcMode := srcInfo.Mode().Perm()
+
 	binary, err := IsBinary(srcPath)
 	if err != nil {
 		return err
@@ -512,6 +549,7 @@ func (w *worker) renderFile(srcPath, dstPath, relPath string, isTemplate bool) e
 		if err := CopyFile(srcPath, dstPath); err != nil {
 			return err
 		}
+		SyncGitIndexExecutableBit(w.cfg.DstPath, dstPath, srcMode)
 		w.printf("create", relPath, styleOK)
 		return nil
 	}
@@ -519,6 +557,7 @@ func (w *worker) renderFile(srcPath, dstPath, relPath string, isTemplate bool) e
 	if err := w.renderer.RenderFile(srcPath, dstPath, w.answers.Combined()); err != nil {
 		return fmt.Errorf("rendering %s: %w", relPath, err)
 	}
+	SyncGitIndexExecutableBit(w.cfg.DstPath, dstPath, srcMode)
 	w.printf("create", relPath, styleOK)
 	return nil
 }
@@ -534,7 +573,7 @@ func (w *worker) renderSymlink(srcPath, dstPath, relPath string) error {
 			w.printf("create", relPath+" -> "+link, styleOK)
 			return nil
 		}
-		os.Remove(dstPath) // Remove existing if any.
+		_ = os.Remove(dstPath) // Remove existing if any.
 		if err := os.Symlink(link, dstPath); err != nil {
 			return err
 		}
@@ -547,7 +586,69 @@ func (w *worker) renderSymlink(srcPath, dstPath, relPath string) error {
 	if err != nil {
 		return err
 	}
+	ok, err := pathutil.IsSubpath(w.tmpl.LocalPath, resolved)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: symlink %s points outside template root", ErrForbiddenPath, relPath)
+	}
 	return w.renderFile(resolved, dstPath, relPath, IsTemplateSuffix(resolved, w.tmpl.Config.TemplateSuffix))
+}
+
+func (w *worker) loadExternalData(ctx map[string]any, tmplDir string, eo Envops) (map[string]any, error) {
+	external := make(map[string]any, len(w.tmpl.Config.ExternalData))
+	renderer := NewRenderer(ctx, tmplDir, eo)
+	base := w.cfg.DstPath
+	if base == "" {
+		base = "."
+	}
+	for name, pathTemplate := range w.tmpl.Config.ExternalData {
+		renderedPath, err := renderer.RenderString(pathTemplate, ctx)
+		if err != nil {
+			return nil, fmt.Errorf("rendering _external_data.%s path: %w", name, err)
+		}
+		if renderedPath == "" {
+			external[name] = map[string]any{}
+			continue
+		}
+		target := renderedPath
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(base, target)
+		}
+		target = filepath.Clean(target)
+		ok, err := pathutil.IsSubpath(base, target)
+		if err != nil {
+			return nil, err
+		}
+		if !ok && !w.isTrusted() {
+			return nil, fmt.Errorf("%w: _external_data.%s reads %s outside %s", ErrUnsafeTemplate, name, target, base)
+		}
+		data, err := LoadAnswersFile(target)
+		if err != nil {
+			return nil, fmt.Errorf("loading _external_data.%s from %s: %w", name, target, err)
+		}
+		if data == nil {
+			data = map[string]any{}
+		}
+		external[name] = data
+	}
+	return external, nil
+}
+
+func safeJoin(base, rel string) (string, error) {
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("%w: rendered path %q must be relative", ErrForbiddenPath, rel)
+	}
+	target := filepath.Clean(filepath.Join(base, rel))
+	ok, err := pathutil.IsSubpath(base, target)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%w: rendered path %q escapes destination", ErrForbiddenPath, rel)
+	}
+	return target, nil
 }
 
 func (w *worker) executeTasks(tasks []TaskDef) error {
@@ -655,16 +756,18 @@ func (w *worker) checkVersion() error {
 func (w *worker) checkSafety() error {
 	hasTasks := len(w.tmpl.Config.Tasks) > 0
 	hasMigrations := len(w.tmpl.Config.Migrations) > 0
-	if !hasTasks && !hasMigrations {
+	hasExtensions := len(w.tmpl.Config.JinjaExtensions) > 0
+	if !hasTasks && !hasMigrations && !hasExtensions {
 		return nil
 	}
-	if w.cfg.Unsafe {
-		return nil
-	}
-	if w.settings.IsTrusted(w.tmpl.URL) {
+	if w.isTrusted() {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrUnsafeTemplate, w.tmpl.URL)
+}
+
+func (w *worker) isTrusted() bool {
+	return w.cfg.Unsafe || (w.settings != nil && w.settings.IsTrusted(w.tmpl.URL))
 }
 
 // Style constants for output.

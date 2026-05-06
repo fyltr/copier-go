@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/flosch/pongo2/v6"
@@ -18,6 +19,7 @@ type Envops struct {
 	VariableEndString   string `yaml:"variable_end_string"`
 	CommentStartString  string `yaml:"comment_start_string"`
 	CommentEndString    string `yaml:"comment_end_string"`
+	Undefined           string `yaml:"undefined"`
 }
 
 // DefaultEnvops returns pongo2/Jinja2 standard delimiters.
@@ -45,9 +47,10 @@ func (e Envops) isCustom() bool {
 
 // Renderer handles Jinja2-compatible template rendering using pongo2.
 type Renderer struct {
-	baseCtx pongo2.Context
-	tplSet  *pongo2.TemplateSet
-	envops  Envops
+	baseCtx         pongo2.Context
+	tplSet          *pongo2.TemplateSet
+	envops          Envops
+	strictUndefined bool
 }
 
 // NewRenderer creates a Renderer with the given base context, template directory,
@@ -72,19 +75,51 @@ func NewRenderer(baseCtx map[string]any, templateDir string, envops ...Envops) *
 	if len(envops) > 0 {
 		eo = envops[0]
 	}
+	eo = fillEnvopsDefaults(eo)
 
-	return &Renderer{baseCtx: ctx, tplSet: tplSet, envops: eo}
+	return &Renderer{
+		baseCtx:         ctx,
+		tplSet:          tplSet,
+		envops:          eo,
+		strictUndefined: eo.Undefined == "jinja2.StrictUndefined",
+	}
+}
+
+func fillEnvopsDefaults(eo Envops) Envops {
+	d := DefaultEnvops()
+	if eo.BlockStartString == "" {
+		eo.BlockStartString = d.BlockStartString
+	}
+	if eo.BlockEndString == "" {
+		eo.BlockEndString = d.BlockEndString
+	}
+	if eo.VariableStartString == "" {
+		eo.VariableStartString = d.VariableStartString
+	}
+	if eo.VariableEndString == "" {
+		eo.VariableEndString = d.VariableEndString
+	}
+	if eo.CommentStartString == "" {
+		eo.CommentStartString = d.CommentStartString
+	}
+	if eo.CommentEndString == "" {
+		eo.CommentEndString = d.CommentEndString
+	}
+	return eo
 }
 
 // RenderString renders a template string with the given extra context.
 // If custom envops are configured, delimiters are translated before parsing.
 func (r *Renderer) RenderString(template string, extra map[string]any) (string, error) {
 	template = r.toStandard(template)
+	ctx := r.mergedContext(extra)
+	if err := r.checkUndefined(template, ctx); err != nil {
+		return "", err
+	}
 	tpl, err := r.tplSet.FromString(template)
 	if err != nil {
 		return "", fmt.Errorf("parsing template: %w", err)
 	}
-	ctx := r.mergedContext(extra)
 	out, err := tpl.Execute(ctx)
 	if err != nil {
 		return "", fmt.Errorf("executing template: %w", err)
@@ -100,12 +135,15 @@ func (r *Renderer) RenderFile(srcPath, dstPath string, extra map[string]any) err
 	}
 
 	translated := r.toStandard(string(content))
+	ctx := r.mergedContext(extra)
+	if err := r.checkUndefined(translated, ctx); err != nil {
+		return fmt.Errorf("rendering template %s: %w", srcPath, err)
+	}
 	tpl, err := r.tplSet.FromString(translated)
 	if err != nil {
 		return fmt.Errorf("parsing template %s: %w", srcPath, err)
 	}
 
-	ctx := r.mergedContext(extra)
 	result, err := tpl.Execute(ctx)
 	if err != nil {
 		return fmt.Errorf("rendering template %s: %w", srcPath, err)
@@ -120,7 +158,11 @@ func (r *Renderer) RenderFile(srcPath, dstPath string, extra map[string]any) err
 		return err
 	}
 
-	return os.WriteFile(dstPath, []byte(result), info.Mode().Perm())
+	mode := info.Mode().Perm()
+	if err := os.WriteFile(dstPath, []byte(result), mode); err != nil {
+		return err
+	}
+	return os.Chmod(dstPath, mode)
 }
 
 // RenderPath renders a path string, expanding template expressions in path segments.
@@ -230,6 +272,21 @@ func (r *Renderer) mergedContext(extra map[string]any) pongo2.Context {
 	return ctx
 }
 
+var variableTagRe = regexp.MustCompile(`(?s)\{\{\s*([A-Za-z_][A-Za-z0-9_]*)`)
+
+func (r *Renderer) checkUndefined(template string, ctx pongo2.Context) error {
+	if !r.strictUndefined {
+		return nil
+	}
+	for _, match := range variableTagRe.FindAllStringSubmatch(template, -1) {
+		name := match[1]
+		if _, ok := ctx[name]; !ok {
+			return fmt.Errorf("%q is undefined", name)
+		}
+	}
+	return nil
+}
+
 // IsBinary performs a simple heuristic to detect binary files by checking
 // the first 8KB for null bytes.
 func IsBinary(path string) (bool, error) {
@@ -237,7 +294,7 @@ func IsBinary(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, 8192)
 	n, err := f.Read(buf)

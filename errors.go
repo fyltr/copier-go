@@ -1,7 +1,9 @@
-// Package copier provides a library for rendering project templates.
+// Package copier provides a Go port of Copier for rendering project templates.
 //
-// Copier supports scaffolding new projects from templates (local paths or Git URLs),
-// updating existing projects to newer template versions, and interactive questionnaires.
+// It tracks the behavior of the upstream Python project at
+// https://github.com/copier-org/copier while exposing a native Go library API.
+// Copier templates, answers files, Git-based updates, and questionnaires are
+// intended to remain compatible with upstream Copier wherever practical.
 //
 // Use [Copy], [Update], and [Recopy] as the main entry points.
 package copier

@@ -18,6 +18,7 @@ import (
 // gitPrefixes are URL patterns that indicate a Git repository.
 var gitPrefixes = []string{
 	"git@", "git://", "git+",
+	"ssh://",
 	"https://github.com/", "https://gitlab.com/",
 }
 
@@ -75,10 +76,10 @@ func NormalizeURL(rawURL string) (string, bool) {
 
 func isLocalGitRepo(path string) bool {
 	info, err := os.Stat(filepath.Join(path, ".git"))
-	if err != nil {
-		return false
+	if err == nil {
+		return info.IsDir() || info.Mode().IsRegular()
 	}
-	return info.IsDir()
+	return false
 }
 
 // IsGitURL reports whether url points to a Git repository.
@@ -100,25 +101,36 @@ func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, reso
 		return "", "", fmt.Errorf("creating temp dir: %w", err)
 	}
 
-	// Clone via CLI to inherit the user's SSH keys / credential helpers.
-	cloneArgs := []string{"clone", "--no-checkout", url, tmpDir}
-	cmd := exec.Command("git", cloneArgs...)
-	if out, cloneErr := cmd.CombinedOutput(); cloneErr != nil {
-		os.RemoveAll(tmpDir)
-		return "", "", fmt.Errorf("cloning %s: %s: %w", url, strings.TrimSpace(string(out)), cloneErr)
+	if IsGitInstalled() {
+		// Clone via CLI to inherit the user's SSH keys / credential helpers.
+		cloneArgs := []string{"clone", "--no-checkout", url, tmpDir}
+		cmd := exec.Command("git", cloneArgs...)
+		if out, cloneErr := cmd.CombinedOutput(); cloneErr != nil {
+			_ = os.RemoveAll(tmpDir)
+			return "", "", fmt.Errorf("cloning %s: %s: %w", url, strings.TrimSpace(string(out)), cloneErr)
+		}
+	} else {
+		_, cloneErr := git.PlainClone(tmpDir, false, &git.CloneOptions{
+			URL:        url,
+			NoCheckout: true,
+		})
+		if cloneErr != nil {
+			_ = os.RemoveAll(tmpDir)
+			return "", "", fmt.Errorf("cloning %s: %w", url, cloneErr)
+		}
 	}
 
 	// Open the cloned repo with go-git for tag/ref resolution.
 	repo, err := git.PlainOpen(tmpDir)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		return "", "", fmt.Errorf("opening cloned repo: %w", err)
 	}
 
 	if ref == "" {
 		ref, err = latestTag(repo, usePreReleases)
 		if err != nil && !errors.Is(err, errNoTags) {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return "", "", err
 		}
 		// If no tags, use HEAD.
@@ -130,7 +142,7 @@ func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, reso
 			coCmd := exec.Command("git", "checkout", ref)
 			coCmd.Dir = tmpDir
 			if out, coErr := coCmd.CombinedOutput(); coErr != nil {
-				os.RemoveAll(tmpDir)
+				_ = os.RemoveAll(tmpDir)
 				return "", "", fmt.Errorf("checkout %s: %s: %w", ref, strings.TrimSpace(string(out)), coErr)
 			}
 		}
@@ -138,11 +150,11 @@ func CloneTemplate(url, ref string, usePreReleases bool) (localPath string, reso
 		// Checkout HEAD.
 		wt, wtErr := repo.Worktree()
 		if wtErr != nil {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return "", "", wtErr
 		}
 		if coErr := wt.Checkout(&git.CheckoutOptions{}); coErr != nil {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return "", "", coErr
 		}
 	}
@@ -222,7 +234,7 @@ func checkoutRef(repo *git.Repository, ref string) error {
 
 // RepoCommitHash returns the HEAD commit hash for a local git repository.
 func RepoCommitHash(repoPath string) (string, error) {
-	repo, err := git.PlainOpen(repoPath)
+	repo, err := git.PlainOpenWithOptions(repoPath, &git.PlainOpenOptions{DetectDotGit: true})
 	if err != nil {
 		return "", err
 	}
@@ -231,6 +243,19 @@ func RepoCommitHash(repoPath string) (string, error) {
 		return "", err
 	}
 	return head.Hash().String(), nil
+}
+
+// RepoCommitDescription returns a git describe-style reference for HEAD.
+func RepoCommitDescription(repoPath string) (string, error) {
+	if IsGitInstalled() {
+		cmd := exec.Command("git", "describe", "--tags", "--always")
+		cmd.Dir = repoPath
+		out, err := cmd.Output()
+		if err == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+	}
+	return RepoCommitHash(repoPath)
 }
 
 // GitInit initialises a new git repository at the given path.
@@ -295,9 +320,57 @@ func GitDiff(repoPath string, contextLines int) ([]byte, error) {
 	return cmd.Output()
 }
 
+// SyncGitIndexExecutableBit updates the destination git index mode when git is
+// configured to ignore filesystem mode changes.
+func SyncGitIndexExecutableBit(dstRoot, dstPath string, srcMode os.FileMode) {
+	if !IsGitInstalled() {
+		return
+	}
+	configCmd := exec.Command("git", "-C", dstRoot, "config", "--type=bool", "--get", "core.fileMode")
+	configOut, err := configCmd.Output()
+	if err != nil || strings.TrimSpace(string(configOut)) != "false" {
+		return
+	}
+	topCmd := exec.Command("git", "-C", dstRoot, "rev-parse", "--show-toplevel")
+	topOut, err := topCmd.Output()
+	if err != nil {
+		return
+	}
+	top := strings.TrimSpace(string(topOut))
+	rel, err := filepath.Rel(top, dstPath)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+		return
+	}
+	rel = filepath.ToSlash(rel)
+	lsCmd := exec.Command("git", "-C", top, "ls-files", "--stage", "--", rel)
+	lsOut, err := lsCmd.Output()
+	if err != nil {
+		return
+	}
+	line := strings.TrimSpace(string(lsOut))
+	if line == "" {
+		return
+	}
+	meta := strings.Fields(strings.SplitN(line, "\t", 2)[0])
+	if len(meta) < 2 {
+		return
+	}
+	currentMode := meta[0]
+	sha := meta[1]
+	desiredExecutable := srcMode&0o111 != 0
+	currentExecutable := strings.HasSuffix(currentMode, "755")
+	if desiredExecutable == currentExecutable {
+		return
+	}
+	newMode := "100644"
+	if desiredExecutable {
+		newMode = "100755"
+	}
+	_ = exec.Command("git", "-C", top, "update-index", "--cacheinfo", fmt.Sprintf("%s,%s,%s", newMode, sha, rel)).Run()
+}
+
 // IsGitInstalled reports whether git is available on PATH.
 func IsGitInstalled() bool {
 	_, err := exec.LookPath("git")
 	return err == nil
 }
-

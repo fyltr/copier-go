@@ -30,12 +30,21 @@ func TestRenderer_RenderString_WithExtra(t *testing.T) {
 	}
 }
 
+func TestRenderer_StrictUndefined(t *testing.T) {
+	r := NewRenderer(map[string]any{}, "", Envops{Undefined: "jinja2.StrictUndefined"})
+
+	_, err := r.RenderString("{{ missing }}", nil)
+	if err == nil {
+		t.Fatal("expected strict undefined error")
+	}
+}
+
 func TestRenderer_RenderFile(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "template.txt.jinja")
 	dst := filepath.Join(dir, "output.txt")
 
-	os.WriteFile(src, []byte("Project: {{ project_name }}"), 0o644)
+	mustWriteFile(t, src, []byte("Project: {{ project_name }}"), 0o644)
 
 	r := NewRenderer(map[string]any{"project_name": "myapp"}, dir)
 	err := r.RenderFile(src, dst, nil)
@@ -56,7 +65,7 @@ func TestIsBinary(t *testing.T) {
 	dir := t.TempDir()
 
 	text := filepath.Join(dir, "text.txt")
-	os.WriteFile(text, []byte("hello world"), 0o644)
+	mustWriteFile(t, text, []byte("hello world"), 0o644)
 	bin, err := IsBinary(text)
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +75,7 @@ func TestIsBinary(t *testing.T) {
 	}
 
 	binFile := filepath.Join(dir, "binary.bin")
-	os.WriteFile(binFile, []byte{0x00, 0x01, 0x02}, 0o644)
+	mustWriteFile(t, binFile, []byte{0x00, 0x01, 0x02}, 0o644)
 	bin, err = IsBinary(binFile)
 	if err != nil {
 		t.Fatal(err)

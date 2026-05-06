@@ -61,8 +61,8 @@ func TestLoadTemplate_NoConfig(t *testing.T) {
 
 func TestLoadTemplate_BothConfigs(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "copier.yml"), []byte("x: 1"), 0o644)
-	os.WriteFile(filepath.Join(dir, "copier.yaml"), []byte("x: 1"), 0o644)
+	mustWriteFile(t, filepath.Join(dir, "copier.yml"), []byte("x: 1"), 0o644)
+	mustWriteFile(t, filepath.Join(dir, "copier.yaml"), []byte("x: 1"), 0o644)
 
 	_, err := LoadTemplate(dir, "", false)
 	if err == nil {
@@ -79,6 +79,33 @@ func TestTemplate_CopyRoot(t *testing.T) {
 	tmpl.Config.Subdirectory = "project"
 	if tmpl.CopyRoot() != "/templates/mytemplate/project" {
 		t.Fatalf("expected /templates/mytemplate/project, got %s", tmpl.CopyRoot())
+	}
+}
+
+func TestLoadTemplate_SubdirectoryEscapesRoot(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "copier.yml"), []byte("_subdirectory: ../outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadTemplate(dir, "", false)
+	if err == nil {
+		t.Fatal("expected error for escaping _subdirectory")
+	}
+}
+
+func TestLoadTemplate_InvalidUndefined(t *testing.T) {
+	dir := t.TempDir()
+	config := `_envops:
+  undefined: jinja2.ChainableUndefined
+`
+	if err := os.WriteFile(filepath.Join(dir, "copier.yml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadTemplate(dir, "", false)
+	if err == nil {
+		t.Fatal("expected error for unsupported envops.undefined")
 	}
 }
 

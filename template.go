@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/fyltr/copier-go/internal/pathutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -18,11 +19,17 @@ type Template struct {
 	// LocalPath is the absolute path to the template on disk (cloned or direct).
 	LocalPath string
 
+	// Temporary is true when LocalPath points to a clone that should be removed.
+	Temporary bool
+
 	// Ref is the resolved git reference (tag, branch, commit).
 	Ref string
 
 	// CommitHash is the full git commit hash of the checked-out template.
 	CommitHash string
+
+	// CommitDescription is the git describe-style reference saved for updates.
+	CommitDescription string
 
 	// Config holds parsed copier.yml settings (keys prefixed with _).
 	Config TemplateConfig
@@ -36,17 +43,18 @@ type Template struct {
 
 // TemplateConfig holds configuration from copier.yml underscore-prefixed keys.
 type TemplateConfig struct {
-	AnswersFile      string     `yaml:"_answers_file"`
-	Subdirectory     string     `yaml:"_subdirectory"`
-	TemplateSuffix   string     `yaml:"_templates_suffix"`
-	Exclude          []string   `yaml:"_exclude"`
-	SkipIfExists     []string   `yaml:"_skip_if_exists"`
-	Tasks            []TaskDef  `yaml:"_tasks"`
-	JinjaExtensions  []string   `yaml:"_jinja_extensions"`
-	SecretQuestions  []string   `yaml:"_secret_questions"`
-	PreserveSymlinks bool       `yaml:"_preserve_symlinks"`
-	MinCopierVersion string     `yaml:"_min_copier_version"`
-	Envops           Envops         `yaml:"_envops"`
+	AnswersFile      string            `yaml:"_answers_file"`
+	Subdirectory     string            `yaml:"_subdirectory"`
+	TemplateSuffix   string            `yaml:"_templates_suffix"`
+	Exclude          []string          `yaml:"_exclude"`
+	SkipIfExists     []string          `yaml:"_skip_if_exists"`
+	Tasks            []TaskDef         `yaml:"_tasks"`
+	JinjaExtensions  []string          `yaml:"_jinja_extensions"`
+	SecretQuestions  []string          `yaml:"_secret_questions"`
+	PreserveSymlinks bool              `yaml:"_preserve_symlinks"`
+	MinCopierVersion string            `yaml:"_min_copier_version"`
+	Envops           Envops            `yaml:"_envops"`
+	ExternalData     map[string]string `yaml:"_external_data"`
 
 	MessageBeforeCopy   string `yaml:"_message_before_copy"`
 	MessageAfterCopy    string `yaml:"_message_after_copy"`
@@ -103,45 +111,66 @@ type MigrationDef struct {
 // QuestionDef holds the raw question definition from copier.yml.
 type QuestionDef struct {
 	Name        string
-	Type        QuestionType   `yaml:"type"`
-	Help        string         `yaml:"help"`
-	Choices     any            `yaml:"choices"` // []any or map[string]any or string (Jinja)
-	Multiselect bool           `yaml:"multiselect"`
-	Default     any            `yaml:"default"`
-	Secret      bool           `yaml:"secret"`
-	Multiline   any            `yaml:"multiline"` // bool or string
-	Placeholder string         `yaml:"placeholder"`
-	Validator   string         `yaml:"validator"`
-	When        any            `yaml:"when"` // bool or string (Jinja condition)
+	Type        QuestionType `yaml:"type"`
+	Help        string       `yaml:"help"`
+	Choices     any          `yaml:"choices"` // []any or map[string]any or string (Jinja)
+	Multiselect bool         `yaml:"multiselect"`
+	Default     any          `yaml:"default"`
+	Secret      bool         `yaml:"secret"`
+	Multiline   any          `yaml:"multiline"` // bool or string
+	Placeholder string       `yaml:"placeholder"`
+	Validator   string       `yaml:"validator"`
+	When        any          `yaml:"when"` // bool or string (Jinja condition)
 }
 
 // LoadTemplate loads a template from a local path or Git URL.
 // If url is a Git URL, it clones the repository. ref selects a specific version.
 func LoadTemplate(url, ref string, usePreReleases bool) (*Template, error) {
-	tmpl := &Template{URL: url}
+	originalURL := url
+	tmpl := &Template{URL: originalURL}
 
 	url, isGit := NormalizeURL(url)
 	if isGit {
+		if isLocalPath(url) {
+			tmpl.URL = url
+		}
 		localPath, resolvedRef, err := CloneTemplate(url, ref, usePreReleases)
 		if err != nil {
 			return nil, &TemplateError{Path: url, Err: err}
 		}
 		tmpl.LocalPath = localPath
+		tmpl.Temporary = true
 		tmpl.Ref = resolvedRef
 
 		hash, err := RepoCommitHash(localPath)
 		if err == nil {
 			tmpl.CommitHash = hash
 		}
+		desc, err := RepoCommitDescription(localPath)
+		if err == nil {
+			tmpl.CommitDescription = desc
+		} else if tmpl.Ref != "" {
+			tmpl.CommitDescription = tmpl.Ref
+		}
+		if tmpl.Ref != "" {
+			if _, err := semver.NewVersion(strings.TrimPrefix(tmpl.Ref, "v")); err == nil {
+				tmpl.CommitDescription = tmpl.Ref
+			}
+		}
 	} else {
 		absPath, err := filepath.Abs(url)
 		if err != nil {
 			return nil, &TemplateError{Path: url, Err: err}
 		}
+		tmpl.URL = absPath
 		tmpl.LocalPath = absPath
 		if isLocalGitRepo(absPath) {
 			hash, _ := RepoCommitHash(absPath)
 			tmpl.CommitHash = hash
+			desc, err := RepoCommitDescription(absPath)
+			if err == nil {
+				tmpl.CommitDescription = desc
+			}
 		}
 	}
 
@@ -150,6 +179,13 @@ func LoadTemplate(url, ref string, usePreReleases bool) (*Template, error) {
 	}
 
 	return tmpl, nil
+}
+
+// Cleanup removes temporary template clones created while loading Git templates.
+func (t *Template) Cleanup() {
+	if t != nil && t.Temporary && t.LocalPath != "" {
+		_ = os.RemoveAll(t.LocalPath)
+	}
 }
 
 // loadConfig reads and parses copier.yml/copier.yaml from the template directory.
@@ -216,6 +252,12 @@ func (t *Template) loadConfig() error {
 	}
 	if t.Config.AnswersFile == "" {
 		t.Config.AnswersFile = AnswersFileName
+	}
+	if err := t.validateSubdirectory(); err != nil {
+		return &TemplateError{Path: configPath, Err: err}
+	}
+	if err := t.validateEnvops(); err != nil {
+		return &TemplateError{Path: configPath, Err: err}
 	}
 
 	// Parse questions.
@@ -315,9 +357,36 @@ func sortQuestions(qs []QuestionDef) {
 // CopyRoot returns the root directory for template files, accounting for subdirectory.
 func (t *Template) CopyRoot() string {
 	if t.Config.Subdirectory != "" {
-		return filepath.Join(t.LocalPath, t.Config.Subdirectory)
+		return filepath.Clean(filepath.Join(t.LocalPath, t.Config.Subdirectory))
 	}
 	return t.LocalPath
+}
+
+func (t *Template) validateSubdirectory() error {
+	if t.Config.Subdirectory == "" {
+		return nil
+	}
+	if filepath.IsAbs(t.Config.Subdirectory) {
+		return fmt.Errorf("%w: _subdirectory %q must be relative", ErrForbiddenPath, t.Config.Subdirectory)
+	}
+	root := filepath.Join(t.LocalPath, t.Config.Subdirectory)
+	ok, err := pathutil.IsSubpath(t.LocalPath, root)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: _subdirectory %q escapes template root", ErrForbiddenPath, t.Config.Subdirectory)
+	}
+	return nil
+}
+
+func (t *Template) validateEnvops() error {
+	switch t.Config.Envops.Undefined {
+	case "", "jinja2.Undefined", "jinja2.StrictUndefined":
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported envops.undefined value %q", ErrConfig, t.Config.Envops.Undefined)
+	}
 }
 
 // Exclusions returns the combined list of exclude patterns (defaults + template config).
@@ -333,10 +402,20 @@ func (t *Template) Metadata() map[string]any {
 	m := map[string]any{
 		"_src_path": t.URL,
 	}
-	if t.CommitHash != "" {
+	if t.CommitDescription != "" {
+		m["_commit"] = t.CommitDescription
+	} else if t.CommitHash != "" {
 		m["_commit"] = t.CommitHash
 	}
 	return m
+}
+
+func isLocalPath(path string) bool {
+	if strings.Contains(path, "://") || strings.HasPrefix(path, "git@") {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // MinVersion returns the parsed minimum copier version, or nil if not set.

@@ -55,7 +55,7 @@ func Recopy(dst string, opts ...Option) error {
 		return ErrConfig
 	}
 	if sp, ok := lastAnswers["_src_path"]; ok {
-		cfg.SrcPath = sp.(string)
+		cfg.SrcPath = resolveStoredSourcePath(sp.(string), cfg.DstPath)
 	}
 
 	w, err := newWorker(cfg, OpCopy)
