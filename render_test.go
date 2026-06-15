@@ -18,6 +18,21 @@ func TestRenderer_RenderString(t *testing.T) {
 	}
 }
 
+func TestRenderer_DoesNotHTMLEscapeVariables(t *testing.T) {
+	// Copier renders config/source (YAML, TOML, code), not HTML, so variable output must
+	// not be HTML-escaped — pongo2 defaults autoescape on, Jinja2/Copier default it off. A
+	// rendered `"` here would otherwise become `&quot;`, corrupting e.g. quoted YAML values.
+	r := NewRenderer(map[string]any{"v": `"x" & <y>`}, "")
+
+	out, err := r.RenderString("k: {{ v }}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `k: "x" & <y>`; out != want {
+		t.Fatalf("expected %q (unescaped), got %q", want, out)
+	}
+}
+
 func TestRenderer_RenderString_WithExtra(t *testing.T) {
 	r := NewRenderer(map[string]any{"base": "x"}, "")
 

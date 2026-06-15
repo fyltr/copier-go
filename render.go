@@ -11,6 +11,16 @@ import (
 	"github.com/flosch/pongo2/v6"
 )
 
+// Copier renders configuration and source files (YAML, TOML, code), not HTML, so — like
+// Python Copier / Jinja2 — template variable output must NOT be HTML-escaped. pongo2
+// defaults autoescape ON, which turns a rendered `"` into `&quot;` (and `<`, `>`, `&`),
+// corrupting non-HTML output (e.g. a quoted YAML value renders unparseable). Disable it
+// globally to match Jinja2 semantics; templates that genuinely emit HTML can re-enable it
+// with `{% autoescape on %}`.
+func init() {
+	pongo2.SetAutoescape(false)
+}
+
 // Envops configures template delimiters (mirrors Jinja2's Environment options).
 type Envops struct {
 	BlockStartString    string `yaml:"block_start_string"`
