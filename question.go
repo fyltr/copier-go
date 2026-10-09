@@ -752,6 +752,26 @@ func (q *Question) When() (bool, error) {
 	return castToBool(rendered), nil
 }
 
+// EvaluateWhen evaluates the `when` condition of a question outside a
+// questionnaire, the way the questionnaire does: def.When (nil means true) is
+// rendered with answers, which must already be parsed to their types, and cast
+// to a boolean with upstream's rules. The questionnaire also renders it with
+// `_copier_conf`, `_copier_answers` and `_copier_operation`; pass them in
+// answers if a condition uses them. envops selects the template's Jinja
+// options (Template.Config.Envops), such as custom delimiters.
+func EvaluateWhen(def QuestionDef, answers map[string]any, envops ...Envops) (bool, error) {
+	am := NewAnswersMap()
+	am.User = copyMap(answers)
+	ctx := am.Combined()
+	if _, ok := ctx["_copier_phase"]; !ok {
+		ctx["_copier_phase"] = string(PhasePrompt)
+	}
+	if _, ok := ctx["pathjoin"]; !ok {
+		ctx["pathjoin"] = pathJoin
+	}
+	return newQuestion(def, am, nil, NewRenderer(nil, "", envops...), ctx).When()
+}
+
 // AskCondition evaluates the `ask` setting of the question. A false condition
 // does not prompt the question unless it is requested with `--ask`; its
 // previous answer, or else its default, is used instead.

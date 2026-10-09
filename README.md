@@ -33,7 +33,7 @@ https://copier.readthedocs.io/
 Implemented behavior includes:
 
 - `copy`, `recopy`, `update`, and `check-update` CLI commands, with the upstream flags (`--data`, `--data-file`, `--ask`, `--skip-answered`, `--exclude`, `--skip`, `--vcs-ref`, `--prereleases`, `--trust`/`--UNSAFE`, `--conflict`, `--context-lines`, ...).
-- Go library API for `Copy`, `Recopy`, `Update`, and `CheckUpdate`, including a `Prompter` interface for embedding custom UIs.
+- Go library API for `Copy`, `Recopy`, `Update`, and `CheckUpdate`, including a `Prompter` interface for embedding custom UIs and `EvaluateWhen` to evaluate a question's `when` condition outside the questionnaire (e.g. for an input form).
 - Local path and Git template sources, including GitHub and GitLab shortcuts, `git+` URLs, bundles and `~` expansion.
 - Remote Git templates are cached as bare mirrors under `$COPIER_CACHE_DIR` (default: the user cache dir, e.g. `~/.cache/copier/git`) and checked out as temporary worktrees, so repeated use avoids full re-downloads.
 - Latest version tag selection using PEP 440 ordering (also accepting semver spellings), pre-release handling, pinned refs (`--vcs-ref`, `:current:`), and template metadata (`_src_path`, `_commit`) in the answers file.

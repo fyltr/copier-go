@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // scriptedPrompter answers questions from a map, falling back to defaults.
@@ -1029,4 +1031,80 @@ func TestCopy_DestinationSymlinkOutsideDestinationRoot(t *testing.T) {
 			t.Fatalf("preserve=%v: symlink target modified: %q", preserve, got)
 		}
 	}
+}
+
+// EvaluateWhen must agree with the questionnaire: a question is skipped (its
+// answer hidden) exactly when EvaluateWhen reports false.
+func TestEvaluateWhen(t *testing.T) {
+	for _, tc := range []struct {
+		when    any
+		answers map[string]any
+		want    bool
+	}{
+		{nil, nil, true},
+		{true, nil, true},
+		{false, nil, false},
+		{"", nil, false},
+		{"{{ runtime_mode == 'docker' }}", map[string]any{"runtime_mode": "docker"}, true},
+		{"{{ runtime_mode == 'docker' }}", map[string]any{"runtime_mode": "process"}, false},
+		{"{{ use_db }}", map[string]any{"use_db": false}, false},
+		{"{{ use_db }}", map[string]any{"use_db": true}, true},
+		{"{{ count }}", map[string]any{"count": int64(0)}, false},
+		{"{{ count }}", map[string]any{"count": int64(2)}, true},
+		{"no", nil, false},
+		{"{{ _copier_phase == 'prompt' }}", nil, true},
+	} {
+		got, err := EvaluateWhen(QuestionDef{Name: "q", When: tc.when}, tc.answers)
+		if err != nil {
+			t.Fatalf("when=%v: %v", tc.when, err)
+		}
+		if got != tc.want {
+			t.Errorf("EvaluateWhen(when=%v, %v) = %v, want %v", tc.when, tc.answers, got, tc.want)
+		}
+
+		// The questionnaire hides the answer exactly when the condition is false.
+		src := t.TempDir()
+		dst := t.TempDir()
+		cfg := map[string]any{"q": map[string]any{"type": "str", "default": "x"}}
+		for k, v := range tc.answers {
+			cfg[k] = map[string]any{"default": v}
+		}
+		if tc.when != nil {
+			cfg["q"].(map[string]any)["when"] = tc.when
+		}
+		var yml strings.Builder
+		for _, k := range []string{"runtime_mode", "use_db", "count", "q"} {
+			if v, ok := cfg[k]; ok {
+				b, err := yamlMarshalForTest(map[string]any{k: v})
+				if err != nil {
+					t.Fatal(err)
+				}
+				yml.WriteString(b)
+			}
+		}
+		writeTree(t, src, map[string]string{"copier.yml": yml.String(), "{{ _copier_conf.answers_file }}.jinja": "{{ _copier_answers|to_nice_yaml }}"})
+		if err := Copy(src, dst, WithQuiet(true), WithDefaults(true)); err != nil {
+			t.Fatalf("when=%v: %v", tc.when, err)
+		}
+		answers, err := LoadAnswersFile(filepath.Join(dst, ".copier-answers.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, asked := answers["q"]; asked != tc.want {
+			t.Errorf("when=%v %v: questionnaire recorded q=%v, EvaluateWhen=%v", tc.when, tc.answers, asked, tc.want)
+		}
+	}
+}
+
+func TestEvaluateWhen_Envops(t *testing.T) {
+	got, err := EvaluateWhen(QuestionDef{Name: "q", When: "[[ flag ]]"}, map[string]any{"flag": true},
+		Envops{VariableStartString: "[[", VariableEndString: "]]", BlockStartString: "[%", BlockEndString: "%]"})
+	if err != nil || !got {
+		t.Fatalf("EvaluateWhen with custom delimiters = %v, %v; want true", got, err)
+	}
+}
+
+func yamlMarshalForTest(v any) (string, error) {
+	b, err := yaml.Marshal(v)
+	return string(b), err
 }
