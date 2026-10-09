@@ -65,7 +65,7 @@ Common flags are shared via `commonFlags` struct in `flags.go`.
 
 ### Internal Packages
 
-- `internal/version` — build-time version injection via ldflags
+- `internal/version` — build-time version injection via ldflags (falling back to the module build info) and `Upstream`, the tracked upstream Copier version
 - `internal/textutil` — string helpers (`EnsureSuffix`, `ToBool`, `IsBlank`)
 - `internal/pathutil` — path validation (`IsSubpath`, symlink-aware `IsWithin`/`Resolve`), git path decoding
 
@@ -76,7 +76,7 @@ Common flags are shared via `commonFlags` struct in `flags.go`.
 - **`Renderer` abstraction** wraps pongo2 with a consistent context-merge pattern
 - **Layered `AnswersMap`** — precedence chain replaces Python's `ChainMap`
 - **`PatternMatcher`** compiles gitignore-style patterns once for reuse across file walks (same semantics as upstream's PathSpec)
-- **Upstream sync** — README.md records the upstream version the port tracks; when porting upstream changes, prefer upstream semantics and document deliberate differences there
+- **Upstream sync** — README.md records the upstream version the port tracks, and `internal/version.Upstream` holds it for `_min_copier_version` checks (bump both when syncing a new upstream release); when porting upstream changes, prefer upstream semantics and document deliberate differences there
 
 ## Dependencies
 

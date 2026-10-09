@@ -1494,10 +1494,11 @@ func (w *worker) checkVersion() error {
 	if minVer == nil {
 		return nil
 	}
-	current, err := parseTemplateVersion(version.Version)
+	// `_min_copier_version` names an upstream Copier version, so compare it
+	// with the upstream version this port tracks.
+	current, err := parseTemplateVersion(version.Upstream)
 	if err != nil {
-		// Dev version — cannot check.
-		return nil
+		return err
 	}
 	if current.LessThan(minVer) {
 		return fmt.Errorf("%w: this template requires Copier version >= %s, while your version of Copier is %s",

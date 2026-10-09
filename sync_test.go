@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/fyltr/copier-go/internal/version"
 )
 
 // scriptedPrompter answers questions from a map, falling back to defaults.
@@ -1107,4 +1109,23 @@ func TestEvaluateWhen_Envops(t *testing.T) {
 func yamlMarshalForTest(v any) (string, error) {
 	b, err := yaml.Marshal(v)
 	return string(b), err
+}
+
+// `_min_copier_version` is checked against the upstream Copier version the port
+// tracks, not against copier-go's own release version.
+func TestCopy_MinCopierVersion(t *testing.T) {
+	for _, tc := range []struct {
+		min string
+		ok  bool
+	}{{"9.0.0", true}, {version.Upstream, true}, {"99.0.0", false}} {
+		src := t.TempDir()
+		writeTree(t, src, map[string]string{"copier.yml": "_min_copier_version: \"" + tc.min + "\"\n"})
+		err := Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true))
+		if tc.ok && err != nil {
+			t.Fatalf("min %s: %v", tc.min, err)
+		}
+		if !tc.ok && !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("min %s: expected ErrUnsupportedVersion, got %v", tc.min, err)
+		}
+	}
 }

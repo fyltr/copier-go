@@ -38,7 +38,7 @@ func newRootCmd() *cobra.Command {
 		Use:           "copier",
 		Short:         "A tool for rendering project templates",
 		Long:          "Copier scaffolds projects from templates, supports updates, and interactive questionnaires.",
-		Version:       version.Version,
+		Version:       version.Version + " (Copier " + version.Upstream + ")",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

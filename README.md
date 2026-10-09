@@ -71,6 +71,7 @@ The intended user-facing behavior is the same, but this is not the same codebase
 | `ssh://` URLs | Need `git+` or a `.git` suffix | Recognized as Git URLs directly |
 | Binary `.jinja` files | Error (undecodable) | Copied verbatim |
 | `Update` in the library | Requires `overwrite=True` | Overwrite is implied |
+| `_min_copier_version` | Compared with the installed Copier version | Compared with the upstream Copier version the port tracks (`internal/version.Upstream`, shown by `copier --version`) |
 
 Templates that use standard Copier configuration and ordinary Jinja syntax should be the compatibility target. Templates that depend on custom Python Jinja extensions, Python-only filters, or very specific Jinja2 internals may need equivalent Go support before they work here.
 
