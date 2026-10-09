@@ -72,7 +72,7 @@ func TestCheckUpdate(t *testing.T) {
 	}
 }
 
-func runGit(t *testing.T, dir string, args ...string) {
+func runGit(t testing.TB, dir string, args ...string) {
 	t.Helper()
 	base := []string{"-c", "user.name=Test User", "-c", "user.email=test@example.com"}
 	cmd := exec.Command("git", append(base, args...)...)

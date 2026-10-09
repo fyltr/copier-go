@@ -40,23 +40,26 @@ Configuration is via functional options (`WithData`, `WithDefaults`, `WithUnsafe
 
 | File | Responsibility |
 |------|---------------|
-| `worker.go` | Execution engine: orchestrates prompt → render → tasks → migrate phases. Contains the `worker` struct, `runCopy()`, `runUpdate()`, and the 3-way merge algorithm. |
-| `template.go` | Loads `copier.yml`/`copier.yaml`, parses config (underscore-prefixed keys) and questions (other keys). Handles `TemplateConfig`, `TaskDef`, `MigrationDef`. |
-| `question.go` | `AnswersMap` with layered precedence (User > Init > Metadata > Last > UserDefaults > Builtin). Answer parsing, type coercion, validation, and conditional display (`ShouldAsk`, `ValidateAnswer`). |
-| `prompt.go` | `TerminalPrompter` — interactive UI using charmbracelet/huh. Implements the `Prompter` interface for testability. |
-| `render.go` | Jinja2-compatible template rendering via pongo2. `Renderer` handles string, file, and path rendering. Binary detection. |
-| `vcs.go` | Git operations via go-git: clone, tag discovery, semver sorting, URL normalization (`gh:`, `gl:` shortcuts). Falls back to `git` CLI for apply/diff. |
-| `settings.go` | User settings from `$XDG_CONFIG_HOME/copier/settings.yml`. Trust lists and default answers. |
-| `fileops.go` | File copy, directory walk, glob-based pattern matching, answers file I/O. |
+| `worker.go` | Execution engine mirroring upstream's `Worker`: prompt → render → tasks phases (`doCopy`), the questionnaire (`ask`), render context (`_copier_conf`, `_copier_answers`), and the upstream update algorithm (`applyUpdate`: old/new renders, `git apply --reject`, inline conflict markers, deleted-file handling, migrations). |
+| `template.go` | Loads `copier.yml`/`copier.yaml` (multi-document, `!include` with globs restricted to the template root, upstream merge rules), parses config (underscore-prefixed keys) and questions (other keys, in file order). Handles `TemplateConfig`, `TaskDef`, `MigrationDef` (new and legacy formats), `MigrationTasks`. |
+| `question.go` | `AnswersMap` with layered precedence (User > Init > Metadata > Last > UserDefaults > External > Builtin) and `Question`, a port of upstream's question logic: type inference, casting, choices (dict/tuple/dynamic, disabled via validator), defaults (`UNSET`), `when`, validators, multiselect parsing. |
+| `prompt.go` | `TerminalPrompter` — interactive UI using `charm.land/huh/v2`. Implements the `Prompter` interface; custom prompters can be injected with `WithPrompter`. |
+| `render.go` | Jinja2-compatible template rendering via pongo2. `Renderer` handles string and path rendering (with the `{% yield %}` tag), a loader sandboxed to the template root for `{% include %}`, custom delimiters, and a StrictUndefined approximation. |
+| `filters.go` | Jinja / jinja2-ansible-filters style filters registered in pongo2 (`to_nice_yaml`, `to_json`, `hash`, `strftime`, ...). |
+| `vcs.go` | Git operations through the `git` CLI (go-git only as a fallback when git is missing): URL resolution (`gh:`, `gl:`, `git+`), the bare-mirror cache with temporary worktrees for remote templates, local clones including dirty changes, PEP 440 tag selection, and the helpers the update algorithm needs (alternates, diff-tree, apply, merge-file, index stages). |
+| `version.go` | PEP 440-style version parsing/ordering (`templateVersion`), used for tags, migrations and check-update; converts `git describe` output like upstream. |
+| `settings.go` | User settings from `$XDG_CONFIG_HOME/copier/settings.yml`. Trust lists with upstream's URL normalization (percent-decoding, dot segments, SCP/alias URLs) and default answers. |
+| `fileops.go` | File copy, gitignore-style `PatternMatcher` (go-git's gitignore package), fnmatch for `--ask`, answers file I/O, directory comparison/removal for updates, `**` globbing for includes. |
 | `types.go` | Enums (`Phase`, `Operation`, `ConflictStrategy`, `QuestionType`), constants, `LazyMap` for deferred computation. |
-| `errors.go` | Sentinel errors and typed error structs (`TemplateError`, `TaskExecError`, `QuestionError`, `ValidationError`). |
+| `errors.go` | Sentinel errors and typed error structs (`TemplateError`, `TaskExecError`, `QuestionError`, `ValidationError`, `InvalidChoiceError`, `UnsafeTemplateError`). |
 
 ### CLI (`cmd/copier/`)
 
 Built on cobra. Three subcommands mirror the library API:
-- `copier copy TEMPLATE DESTINATION` — flags: `-d/--data`, `-l/--defaults`, `-f/--force`, `-w/--overwrite`, `-n/--pretend`
-- `copier update [DESTINATION]` — flags: `-o/--conflict`, `-c/--context-lines`, `-A/--skip-answered`
+- `copier copy TEMPLATE DESTINATION` — flags: `-d/--data`, `--data-file`, `--ask`, `-l/--defaults`, `-f/--force`, `-w/--overwrite`, `-n/--pretend`
+- `copier update [DESTINATION]` — flags: `-o/--conflict`, `-c/--context-lines`, `-A/--skip-answered`, `--ask` (overwrite is implied)
 - `copier recopy [DESTINATION]` — same as copy minus src argument
+- `copier check-update [DESTINATION]` — reports whether a newer template version exists
 
 Common flags are shared via `commonFlags` struct in `flags.go`.
 
@@ -64,7 +67,7 @@ Common flags are shared via `commonFlags` struct in `flags.go`.
 
 - `internal/version` — build-time version injection via ldflags
 - `internal/textutil` — string helpers (`EnsureSuffix`, `ToBool`, `IsBlank`)
-- `internal/pathutil` — path validation (`IsSubpath`), git path decoding
+- `internal/pathutil` — path validation (`IsSubpath`, symlink-aware `IsWithin`/`Resolve`), git path decoding
 
 ### Key Design Patterns
 
@@ -72,15 +75,17 @@ Common flags are shared via `commonFlags` struct in `flags.go`.
 - **`Prompter` interface** decouples the UI from core logic for testability
 - **`Renderer` abstraction** wraps pongo2 with a consistent context-merge pattern
 - **Layered `AnswersMap`** — precedence chain replaces Python's `ChainMap`
-- **`PatternMatcher`** compiles glob patterns once for reuse across file walks
+- **`PatternMatcher`** compiles gitignore-style patterns once for reuse across file walks (same semantics as upstream's PathSpec)
+- **Upstream sync** — README.md records the upstream version the port tracks; when porting upstream changes, prefer upstream semantics and document deliberate differences there
 
 ## Dependencies
 
-- `go-git/go-git` — pure-Go git (clone, tags, checkout); CLI `git` fallback for apply/diff
-- `flosch/pongo2` — Jinja2-compatible template engine
-- `charmbracelet/huh` — terminal forms/prompts
+- `git` CLI — primary VCS backend (clone/mirror/worktree, describe, diff, apply, merge-file)
+- `go-git/go-git` — fallback clone when git is unavailable; its `gitignore` package powers pattern matching
+- `flosch/pongo2` v6.1 — Jinja2-like template engine (single-argument `|filter:arg` syntax)
+- `charm.land/huh/v2` (on Bubble Tea v2 / Lip Gloss v2 / Bubbles v2) — terminal forms/prompts. Keep the charm major versions aligned with other binaries embedding this library so only one copy is linked.
 - `spf13/cobra` — CLI framework
-- `Masterminds/semver` — semver parsing and sorting
-- `gobwas/glob` — glob pattern matching
-- `adrg/xdg` — XDG base directory paths
-- `gopkg.in/yaml.v3` — YAML parsing
+- `adrg/xdg` — XDG base directory paths (settings and the Git mirror cache)
+- `gopkg.in/yaml.v3` — YAML parsing (Node API is used for `!include` and ordered questions)
+
+Requires Go 1.25.8+ (from `charm.land/huh/v2`).

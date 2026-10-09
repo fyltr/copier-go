@@ -14,6 +14,8 @@ Use upstream Copier documentation when writing templates unless this README expl
 
 https://copier.readthedocs.io/
 
+**Sync status:** the port currently tracks upstream Copier **v9.18.1** (September 2026).
+
 ## Why A Go Port
 
 - Single native binary distribution.
@@ -21,24 +23,36 @@ https://copier.readthedocs.io/
 - No Python runtime requirement for users of the Go CLI.
 - Same Copier concepts for copying, recopying, updating, questionnaires, tasks, and answers files.
 
+## Requirements
+
+- Go 1.25.8 or newer to build (required by `charm.land/huh/v2`).
+- `git` on `PATH` for Git templates, `update`, `recopy` of Git templates and `check-update`. Local directory templates work without git.
+
 ## Current Compatibility
 
-Implemented core behavior includes:
+Implemented behavior includes:
 
-- `copy`, `recopy`, `update`, and `check-update` CLI commands.
-- Go library API for `Copy`, `Recopy`, `Update`, and `CheckUpdate`.
-- Local path and Git template sources, including GitHub and GitLab shortcuts.
-- Latest semver Git tag selection, prerelease handling, pinned refs, and stored template metadata.
-- `copier.yml` and `copier.yaml` template configuration.
-- Interactive and defaulted questions with layered answer precedence.
-- Jinja-like rendering through `pongo2`, including common Copier filters such as `to_yaml`, `to_nice_yaml`, `to_json`, `bool`, and `basename`.
-- Configurable template delimiters through `_envops`.
-- `_envops.undefined: jinja2.StrictUndefined` error behavior for missing top-level variables.
-- `_subdirectory`, `_exclude`, `_skip_if_exists`, `_answers_file`, `_secret_questions`, `_external_data`, `_preserve_symlinks`, and template messages.
-- Core task and migration execution support.
-- Unsafe-feature gating for tasks, migrations, Jinja extensions, and external data reads outside the destination.
-- Three-way update flow using Git diffs.
-- Executable-bit preservation during copy and update.
+- `copy`, `recopy`, `update`, and `check-update` CLI commands, with the upstream flags (`--data`, `--data-file`, `--ask`, `--skip-answered`, `--exclude`, `--skip`, `--vcs-ref`, `--prereleases`, `--trust`/`--UNSAFE`, `--conflict`, `--context-lines`, ...).
+- Go library API for `Copy`, `Recopy`, `Update`, and `CheckUpdate`, including a `Prompter` interface for embedding custom UIs.
+- Local path and Git template sources, including GitHub and GitLab shortcuts, `git+` URLs, bundles and `~` expansion.
+- Remote Git templates are cached as bare mirrors under `$COPIER_CACHE_DIR` (default: the user cache dir, e.g. `~/.cache/copier/git`) and checked out as temporary worktrees, so repeated use avoids full re-downloads.
+- Latest version tag selection using PEP 440 ordering (also accepting semver spellings), pre-release handling, pinned refs (`--vcs-ref`, `:current:`), and template metadata (`_src_path`, `_commit`) in the answers file.
+- Dirty changes of local Git templates are included when rendering `HEAD`, like upstream.
+- `copier.yml` / `copier.yaml` loading with multiple YAML documents, the `!include` tag (with globs, restricted to the template root), and upstream merge rules (`_exclude`, `_skip_if_exists`, `_jinja_extensions`, `_secret_questions` are concatenated; other keys are overridden by later documents).
+- Questions asked in definition order, with typed answers (`str`, `int`, `float`, `bool`, `yaml`, `json`, `path`), type inference from defaults, `default`, `help`, `placeholder`, `when`, `validator`, `secret`, `multiline`, `multiselect`, list/dict/tuple-style and dynamic (templated) `choices`, conditional choices via `validator`, and the `UNSET` default marker.
+- Layered answer precedence (user > `--data` > metadata > last answers > user defaults > external data), `--skip-answered`, `--ask` patterns, and settings defaults from `settings.yml`.
+- Answers file rendered from the template's `{{ _copier_conf.answers_file }}.jinja` using `_copier_answers`; when a template has no such file, copier-go writes one itself.
+- Jinja-like rendering through `pongo2`, with the render context upstream provides (`_copier_conf`, `_copier_answers`, `_copier_phase`, `_copier_operation`, `_folder_name`, `_external_data`, `pathjoin`) and common Jinja / `jinja2-ansible-filters` filters (`to_yaml`, `to_nice_yaml`, `to_json`, `to_nice_json`, `from_json`, `from_yaml`, `bool`, `int`, `hash`, `b64encode`, `strftime`, `basename`, `dirname`, `regex_search`, `unique`, `sort`, `combine`, `dict2items`, ...).
+- The `{% yield item from list %}` tag in file and directory names to generate multiple files from one template path.
+- `{% include %}` restricted to the template root (paths or symlinks escaping it are rejected).
+- Configurable template delimiters through `_envops` and `_envops.undefined: jinja2.StrictUndefined` error behavior.
+- `_subdirectory` (templated), `_templates_suffix` (including an empty suffix), `_answers_file`, `_secret_questions`, `_external_data`, `_preserve_symlinks`, `_min_copier_version`, and the `_message_*` settings.
+- gitignore-style (`gitwildmatch`) pattern matching for `_exclude`, `--exclude`, `_skip_if_exists` and `--skip`, evaluated against destination paths and rendered as Jinja (an entry may render to several newline-separated patterns).
+- Tasks in every upstream format (string, argument list, or mapping with `command`, `when`, `working_directory`) with `_stage`/`$STAGE` and `_copier_operation` available.
+- Migrations in the current upstream format (`command`, `version`, `when`, `working_directory`) and the legacy `before`/`after` format, with `_version_from`, `_version_to`, `_version_current` and the `_version_pep440_*` variables.
+- Unsafe-feature gating for tasks, migrations, Jinja extensions, and `_external_data` reads outside the destination, with `--trust`/`--UNSAFE` and the settings trust list. Trust checks normalize URLs (percent-decoding, dot segments, backslashes, SCP-style and alias URLs) so encoded traversal cannot bypass a trusted prefix.
+- The upstream update algorithm: the old and new template versions are rendered with the recorded answers, the project's own changes are extracted as a diff and re-applied with `git apply --reject`, rejected hunks are turned into inline conflict markers (`--conflict inline`, recorded as unmerged in the index) or left as `.rej` files (`--conflict rej`), intentionally deleted files are not recreated, template-managed gitignored files are still updated, and files removed by the new template version are deleted.
+- Executable-bit preservation during copy and update, including `core.fileMode=false` repositories.
 
 ## Differences From Upstream Copier
 
@@ -49,14 +63,14 @@ The intended user-facing behavior is the same, but this is not the same codebase
 | Implementation language | Python | Go |
 | Distribution | Python package and CLI | Go module and native CLI binary |
 | Library API | Python functions/classes | Go functions and functional options |
-| Template engine | Jinja2 | `pongo2` Jinja-like engine |
-| Python Jinja extensions | Loadable Python extensions | Not executed as Python extensions in Go |
-| Plugin ecosystem | Python package ecosystem | Go implementation only |
-| Exact edge cases | Defined by upstream Copier and Jinja2 | Ported where practical, but renderer edge cases can differ |
-| Configuration loader | Supports upstream YAML includes and multi-document merging | Basic `copier.yml`/`copier.yaml` parsing today |
-| Pattern matching | PathSpec/gitignore behavior | Glob-based matching today |
-| Update algorithm | Upstream Python update algorithm | Go implementation with Git diff based merge |
-| CLI surface | Full upstream Python CLI | Core commands and flags implemented |
+| Template engine | Jinja2 | `pongo2` Jinja-like engine (see gaps below) |
+| Python Jinja extensions | Loadable Python extensions | Not executed; templates listing `_jinja_extensions` are still flagged as unsafe |
+| Local template `_src_path` | Recorded as typed (may be relative) | Recorded as an absolute path |
+| Answers file | Only written when the template provides `{{ _copier_conf.answers_file }}.jinja` | Also written by copier-go when the template has none |
+| Task environment | Only `STAGE`, `VERSION_*`, `COPIER_OPERATION` | Additionally every answer as an upper-cased variable (Go extension) |
+| `ssh://` URLs | Need `git+` or a `.git` suffix | Recognized as Git URLs directly |
+| Binary `.jinja` files | Error (undecodable) | Copied verbatim |
+| `Update` in the library | Requires `overwrite=True` | Overwrite is implied |
 
 Templates that use standard Copier configuration and ordinary Jinja syntax should be the compatibility target. Templates that depend on custom Python Jinja extensions, Python-only filters, or very specific Jinja2 internals may need equivalent Go support before they work here.
 
@@ -64,13 +78,13 @@ Templates that use standard Copier configuration and ordinary Jinja syntax shoul
 
 These are compatibility gaps, not intended product differences:
 
+- `pongo2` is Django-flavoured: filters take a single argument with the `{{ x|filter:arg }}` syntax, so Jinja calls like `{{ x|replace('a', 'b') }}`, `{{ x|default('y', true) }}` or multi-argument `regex_replace` do not parse. Tests such as `is defined`, list/dict literals in expressions, and some Jinja-only tags are also unavailable.
 - Custom Python Jinja extensions are not loaded or executed by the Go renderer.
-- Only a subset of upstream Copier's built-in filters and Jinja environment behavior is implemented.
-- The YAML configuration loader does not yet implement upstream `!include` handling or multi-document merge semantics.
-- Exclude and skip matching use glob behavior, not the full upstream PathSpec/gitignore semantics.
-- Some newer upstream task and migration schema details may need additional porting.
-- The update algorithm is implemented in Go but is not yet guaranteed to match every upstream conflict and edge-case behavior.
-- The CLI exposes the core workflow but not every upstream Python CLI option.
+- `jinja2.StrictUndefined` is approximated by scanning expressions for undefined top-level names.
+- Only a subset of the `jinja2-ansible-filters` filters is implemented.
+- Executable bits are read from the filesystem, not from the template's git index (matters on Windows only).
+- `--data` values and interactive input are parsed per question type, but JSON/YAML questions have no syntax-highlighted editor.
+- The `Prompter` UI (`charm.land/huh/v2`) is not a pixel-perfect clone of the `questionary` prompts.
 
 ## Install And Build
 
@@ -118,6 +132,14 @@ Recopy a project from its template using existing answers:
 copier recopy ./my-project
 ```
 
+Force asking selected questions even when answers are known:
+
+```sh
+copier update --skip-answered --ask 'database_*' ./my-project
+```
+
+Environment variables: `COPIER_SETTINGS_PATH` (settings file), `COPIER_CACHE_DIR` (Git mirror cache).
+
 ## Go Library Usage
 
 ```go
@@ -134,6 +156,8 @@ func main() {
 	)
 }
 ```
+
+Embedding applications can supply their own questionnaire UI by implementing the `Prompter` interface and passing it with `copier.WithPrompter(p)`.
 
 ## Sync Policy
 

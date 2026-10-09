@@ -28,6 +28,7 @@ type VcsRef string
 
 const (
 	// VcsRefCurrent tells copier to use the existing template ref from .copier-answers.yml.
+	// Pass it as the ref (`WithVcsRef(string(VcsRefCurrent))`).
 	VcsRefCurrent VcsRef = ":current:"
 )
 
@@ -73,9 +74,9 @@ const DefaultTemplateSuffix = ".jinja"
 // LazyMap is a concurrent-safe map where values are lazily computed on first access.
 // Compute functions are called at most once per key.
 type LazyMap[V any] struct {
-	mu      sync.RWMutex
-	cached  map[string]V
-	funcs   map[string]func() V
+	mu     sync.RWMutex
+	cached map[string]V
+	funcs  map[string]func() V
 }
 
 // NewLazyMap creates a LazyMap with the given compute functions.

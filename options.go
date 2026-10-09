@@ -1,7 +1,5 @@
 package copier
 
-import "path/filepath"
-
 // Config holds all configuration for a copier operation.
 // Use functional [Option] values to construct one via [Copy], [Update], or [Recopy].
 type Config struct {
@@ -11,10 +9,12 @@ type Config struct {
 	// DstPath is the destination directory.
 	DstPath string
 
-	// AnswersFile overrides the default answers file path (.copier-answers.yml).
+	// AnswersFile overrides the answers file path, relative to DstPath. When
+	// empty, the template's `_answers_file` setting or `.copier-answers.yml` is used.
 	AnswersFile string
 
 	// VcsRef selects a specific Git tag, branch, or commit. Empty means latest tag.
+	// The special value ":current:" reuses the ref recorded in the answers file.
 	VcsRef string
 
 	// Data provides pre-set answers that skip interactive prompting.
@@ -50,6 +50,10 @@ type Config struct {
 	// SkipAnswered skips questions whose answers are already known (update/recopy).
 	SkipAnswered bool
 
+	// Ask lists question names (fnmatch-style patterns) to ask even if they
+	// would be skipped by Data, Defaults or SkipAnswered.
+	Ask []string
+
 	// UsePreReleases includes pre-release Git tags when selecting the latest version.
 	UsePreReleases bool
 
@@ -61,11 +65,13 @@ type Config struct {
 
 	// ContextLines sets the number of context lines in diffs for updates.
 	ContextLines int
+
+	// Prompter overrides the interactive prompter (defaults to the terminal UI).
+	Prompter Prompter
 }
 
 func defaultConfig() Config {
 	return Config{
-		AnswersFile:    AnswersFileName,
 		CleanupOnError: true,
 		Conflict:       ConflictInline,
 		ContextLines:   3,
@@ -83,7 +89,7 @@ func applyOptions(opts []Option) Config {
 	return c
 }
 
-// WithAnswersFile sets a custom path for the copier answers file.
+// WithAnswersFile sets a custom path (relative to the destination) for the answers file.
 func WithAnswersFile(path string) Option { return func(c *Config) { c.AnswersFile = path } }
 
 // WithVcsRef pins the template to a specific Git reference (tag, branch, commit).
@@ -124,6 +130,10 @@ func WithSkipTasks(v bool) Option { return func(c *Config) { c.SkipTasks = v } }
 // WithSkipAnswered skips questions that already have answers from a previous run.
 func WithSkipAnswered(v bool) Option { return func(c *Config) { c.SkipAnswered = v } }
 
+// WithAsk forces asking the questions matching the given fnmatch-style
+// patterns, even if they would be skipped by other options.
+func WithAsk(patterns ...string) Option { return func(c *Config) { c.Ask = patterns } }
+
 // WithPreReleases includes pre-release tags when selecting the latest version.
 func WithPreReleases(v bool) Option { return func(c *Config) { c.UsePreReleases = v } }
 
@@ -136,10 +146,5 @@ func WithConflict(s ConflictStrategy) Option { return func(c *Config) { c.Confli
 // WithContextLines sets the number of diff context lines for updates.
 func WithContextLines(n int) Option { return func(c *Config) { c.ContextLines = n } }
 
-// resolvedAnswersFile returns the answers file path relative to DstPath.
-func (c *Config) resolvedAnswersFile() string {
-	if filepath.IsAbs(c.AnswersFile) {
-		return c.AnswersFile
-	}
-	return filepath.Join(c.DstPath, c.AnswersFile)
-}
+// WithPrompter sets a custom Prompter, e.g. for embedding or tests.
+func WithPrompter(p Prompter) Option { return func(c *Config) { c.Prompter = p } }

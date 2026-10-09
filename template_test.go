@@ -32,8 +32,9 @@ _exclude:
 		t.Fatal(err)
 	}
 
-	if tmpl.LocalPath != dir {
-		t.Fatalf("expected local path %s, got %s", dir, tmpl.LocalPath)
+	resolved, _ := filepath.EvalSymlinks(dir)
+	if tmpl.LocalPath != resolved {
+		t.Fatalf("expected local path %s, got %s", resolved, tmpl.LocalPath)
 	}
 	if tmpl.Config.TemplateSuffix != ".jinja" {
 		t.Fatalf("expected .jinja suffix, got %s", tmpl.Config.TemplateSuffix)
@@ -117,6 +118,7 @@ func TestTemplate_Exclusions(t *testing.T) {
 	}
 
 	tmpl.Config.Exclude = []string{"custom"}
+	tmpl.Config.ExcludeSet = true
 	exclusions = tmpl.Exclusions()
 	if len(exclusions) != 1 || exclusions[0] != "custom" {
 		t.Fatalf("expected [custom], got %v", exclusions)
@@ -133,7 +135,8 @@ func TestInferType(t *testing.T) {
 		{42, TypeInt},
 		{3.14, TypeFloat},
 		{"hello", TypeStr},
-		{nil, TypeStr},
+		{nil, TypeYAML},
+		{[]any{"a"}, TypeYAML},
 	}
 	for _, tt := range tests {
 		got := inferType(tt.val)

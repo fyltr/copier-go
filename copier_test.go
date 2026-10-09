@@ -186,8 +186,12 @@ func TestCopy_ExternalDataOutsideDestinationRequiresTrust(t *testing.T) {
 	mustWriteFile(t, filepath.Join(tmplDir, "out.txt.jinja"), []byte("{{ _external_data.parent.name }}"), 0o644)
 
 	err := Copy(tmplDir, dstDir, WithDefaults(true), WithQuiet(true))
-	if !errors.Is(err, ErrUnsafeTemplate) {
-		t.Fatalf("expected ErrUnsafeTemplate, got %v", err)
+	if !errors.Is(err, ErrForbiddenPath) {
+		t.Fatalf("expected ErrForbiddenPath, got %v", err)
+	}
+	// Trusting the template lifts the restriction.
+	if err := Copy(tmplDir, dstDir, WithDefaults(true), WithQuiet(true), WithUnsafe(true), WithOverwrite(true)); err != nil {
+		t.Fatal(err)
 	}
 }
 

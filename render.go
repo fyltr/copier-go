@@ -1,14 +1,20 @@
 package copier
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/flosch/pongo2/v6"
+	"github.com/fyltr/copier-go/internal/pathutil"
 )
 
 // Copier renders configuration and source files (YAML, TOML, code), not HTML, so — like
@@ -19,6 +25,7 @@ import (
 // with `{% autoescape on %}`.
 func init() {
 	pongo2.SetAutoescape(false)
+	_ = pongo2.RegisterTag("yield", tagYieldParser)
 }
 
 // Envops configures template delimiters (mirrors Jinja2's Environment options).
@@ -55,46 +62,6 @@ func (e Envops) isCustom() bool {
 		e.CommentEndString != d.CommentEndString
 }
 
-// Renderer handles Jinja2-compatible template rendering using pongo2.
-type Renderer struct {
-	baseCtx         pongo2.Context
-	tplSet          *pongo2.TemplateSet
-	envops          Envops
-	strictUndefined bool
-}
-
-// NewRenderer creates a Renderer with the given base context, template directory,
-// and optional custom delimiters.
-func NewRenderer(baseCtx map[string]any, templateDir string, envops ...Envops) *Renderer {
-	var loader pongo2.TemplateLoader
-	if templateDir != "" {
-		loader = pongo2.MustNewLocalFileSystemLoader(templateDir)
-	} else {
-		loader = pongo2.MustNewLocalFileSystemLoader("")
-	}
-
-	tplSet := pongo2.NewSet("copier", loader)
-	tplSet.Debug = false
-
-	ctx := make(pongo2.Context, len(baseCtx))
-	for k, v := range baseCtx {
-		ctx[k] = v
-	}
-
-	eo := DefaultEnvops()
-	if len(envops) > 0 {
-		eo = envops[0]
-	}
-	eo = fillEnvopsDefaults(eo)
-
-	return &Renderer{
-		baseCtx:         ctx,
-		tplSet:          tplSet,
-		envops:          eo,
-		strictUndefined: eo.Undefined == "jinja2.StrictUndefined",
-	}
-}
-
 func fillEnvopsDefaults(eo Envops) Envops {
 	d := DefaultEnvops()
 	if eo.BlockStartString == "" {
@@ -118,23 +85,239 @@ func fillEnvopsDefaults(eo Envops) Envops {
 	return eo
 }
 
+// yieldStateKey is the render-context key carrying the yield state of one render.
+const yieldStateKey = "__copier_yield__"
+
+// yieldState records the `{% yield %}` tag found while rendering a path part.
+type yieldState struct {
+	Name     string
+	Iterable []any
+	set      bool
+}
+
+// Renderer handles Jinja2-compatible template rendering using pongo2.
+//
+// `{% include %}` lookups are restricted to the template root: paths that
+// resolve (through `..` or symlinks) outside of it are rejected.
+type Renderer struct {
+	baseCtx         map[string]any
+	tplSet          *pongo2.TemplateSet
+	loader          *sandboxLoader
+	envops          Envops
+	strictUndefined bool
+	root            string
+}
+
+// renderError carries pongo2's detailed message while unwrapping to the
+// original cause, so callers can use errors.Is.
+type renderError struct {
+	msg   string
+	cause error
+}
+
+func (e *renderError) Error() string { return e.msg }
+func (e *renderError) Unwrap() error { return e.cause }
+
+// wrapRenderError converts a pongo2 error into an unwrappable error.
+func (r *Renderer) wrapRenderError(prefix string, err error) error {
+	cause := err
+	var perr *pongo2.Error
+	if errors.As(err, &perr) {
+		if r.loader != nil && r.loader.lastErr != nil {
+			cause = r.loader.lastErr
+		} else if perr.OrigError != nil {
+			cause = perr.OrigError
+		}
+	}
+	return &renderError{msg: prefix + ": " + err.Error(), cause: cause}
+}
+
+// sandboxLoader is a pongo2 loader confined to the template root.
+type sandboxLoader struct {
+	root    string
+	lastErr error // Last forbidden-path error, surfaced when pongo2 swallows it.
+}
+
+func (l *sandboxLoader) Abs(base, name string) string {
+	if filepath.IsAbs(name) {
+		return name
+	}
+	if base != "" {
+		return filepath.Join(filepath.Dir(base), name)
+	}
+	return name
+}
+
+func (l *sandboxLoader) Get(name string) (io.Reader, error) {
+	if l.root == "" {
+		return nil, fmt.Errorf("%w: template includes are not available without a template root", ErrForbiddenPath)
+	}
+	target := name
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(l.root, filepath.FromSlash(name))
+	}
+	ok, err := pathutil.IsWithin(l.root, target)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		l.lastErr = fmt.Errorf("%w: %s is outside the template root", ErrForbiddenPath, name)
+		return nil, l.lastErr
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(data), nil
+}
+
+// NewRenderer creates a Renderer with the given base context, template root
+// directory (used for `{% include %}`), and optional custom delimiters.
+func NewRenderer(baseCtx map[string]any, templateRoot string, envops ...Envops) *Renderer {
+	root := templateRoot
+	if root != "" {
+		if resolved, err := pathutil.Resolve(root); err == nil {
+			root = resolved
+		}
+	}
+	loader := &sandboxLoader{root: root}
+	tplSet := pongo2.NewSet("copier", loader)
+	tplSet.Debug = false
+
+	ctx := make(map[string]any, len(baseCtx))
+	for k, v := range baseCtx {
+		ctx[k] = v
+	}
+
+	eo := DefaultEnvops()
+	if len(envops) > 0 {
+		eo = envops[0]
+	}
+	eo = fillEnvopsDefaults(eo)
+
+	return &Renderer{
+		baseCtx:         ctx,
+		tplSet:          tplSet,
+		loader:          loader,
+		envops:          eo,
+		strictUndefined: eo.Undefined == "jinja2.StrictUndefined",
+		root:            root,
+	}
+}
+
 // RenderString renders a template string with the given extra context.
 // If custom envops are configured, delimiters are translated before parsing.
 func (r *Renderer) RenderString(template string, extra map[string]any) (string, error) {
-	template = r.toStandard(template)
+	out, _, err := r.render(template, extra)
+	return out, err
+}
+
+// RenderStringYield renders a template string and also reports the yield tag
+// state, when the template used `{% yield %}`.
+func (r *Renderer) RenderStringYield(template string, extra map[string]any) (string, *yieldState, error) {
+	return r.render(template, extra)
+}
+
+func (r *Renderer) render(template string, extra map[string]any) (string, *yieldState, error) {
+	template, rawBlocks := r.protectRawBlocks(template)
+	template = aliasLoopVariables(stripJinjaComments(r.toStandard(template)))
 	ctx := r.mergedContext(extra)
+	state := &yieldState{}
+	ctx[yieldStateKey] = state
 	if err := r.checkUndefined(template, ctx); err != nil {
-		return "", err
+		return "", nil, err
 	}
+	r.loader.lastErr = nil
 	tpl, err := r.tplSet.FromString(template)
 	if err != nil {
-		return "", fmt.Errorf("parsing template: %w", err)
+		return "", nil, r.wrapRenderError("parsing template", err)
 	}
 	out, err := tpl.Execute(ctx)
 	if err != nil {
-		return "", fmt.Errorf("executing template: %w", err)
+		return "", nil, r.wrapRenderError("executing template", err)
 	}
-	return r.fromStandard(out), nil
+	return restoreRawBlocks(r.fromStandard(out), rawBlocks), state, nil
+}
+
+// rawPlaceholder wraps the index of a protected `{% raw %}` block.
+const (
+	rawPlaceholderStart = "\U000F0100"
+	rawPlaceholderEnd   = "\U000F0101"
+)
+
+// protectRawBlocks replaces `{% raw %}...{% endraw %}` blocks (using the
+// configured block delimiters) with placeholders so their content is emitted
+// verbatim, like Jinja2 does. pongo2 has no raw tag of its own.
+func (r *Renderer) protectRawBlocks(s string) (string, []string) {
+	bs, be := regexp.QuoteMeta(r.envops.BlockStartString), regexp.QuoteMeta(r.envops.BlockEndString)
+	if !strings.Contains(s, r.envops.BlockStartString) {
+		return s, nil
+	}
+	re := regexp.MustCompile(`(?s)` + bs + `(-?)\s*raw\s*(-?)` + be + `(.*?)` + bs + `(-?)\s*endraw\s*(-?)` + be)
+	matches := re.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return s, nil
+	}
+	var b strings.Builder
+	var blocks []string
+	pos := 0
+	trimNext := false
+	for _, m := range matches {
+		before := s[pos:m[0]]
+		if trimNext {
+			before = strings.TrimLeft(before, " \t\r\n")
+		}
+		if s[m[2]:m[3]] == "-" {
+			before = strings.TrimRight(before, " \t\r\n")
+		}
+		content := s[m[6]:m[7]]
+		if s[m[4]:m[5]] == "-" {
+			content = strings.TrimLeft(content, " \t\r\n")
+		}
+		if s[m[8]:m[9]] == "-" {
+			content = strings.TrimRight(content, " \t\r\n")
+		}
+		trimNext = s[m[10]:m[11]] == "-"
+		b.WriteString(before)
+		fmt.Fprintf(&b, "%s%d%s", rawPlaceholderStart, len(blocks), rawPlaceholderEnd)
+		blocks = append(blocks, content)
+		pos = m[1]
+	}
+	rest := s[pos:]
+	if trimNext {
+		rest = strings.TrimLeft(rest, " \t\r\n")
+	}
+	b.WriteString(rest)
+	return b.String(), blocks
+}
+
+func restoreRawBlocks(s string, blocks []string) string {
+	for i, content := range blocks {
+		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", rawPlaceholderStart, i, rawPlaceholderEnd), content)
+	}
+	return s
+}
+
+var (
+	tagExprRe   = regexp.MustCompile(`(?s)\{\{.*?\}\}|\{%.*?%\}`)
+	loopAliasRe = regexp.MustCompile(`\bloop\.(index0|index|first|last|revindex0|revindex)\b`)
+	loopAliases = map[string]string{
+		"index": "forloop.Counter", "index0": "forloop.Counter0", "first": "forloop.First",
+		"last": "forloop.Last", "revindex": "forloop.Revcounter", "revindex0": "forloop.Revcounter0",
+	}
+)
+
+// aliasLoopVariables maps Jinja's `loop.*` variables inside expressions to
+// pongo2's `forloop.*` equivalents.
+func aliasLoopVariables(s string) string {
+	if !strings.Contains(s, "loop.") {
+		return s
+	}
+	return tagExprRe.ReplaceAllStringFunc(s, func(expr string) string {
+		return loopAliasRe.ReplaceAllStringFunc(expr, func(m string) string {
+			return loopAliases[strings.TrimPrefix(m, "loop.")]
+		})
+	})
 }
 
 // RenderFile renders a template file to the destination path.
@@ -143,31 +326,18 @@ func (r *Renderer) RenderFile(srcPath, dstPath string, extra map[string]any) err
 	if err != nil {
 		return fmt.Errorf("reading template %s: %w", srcPath, err)
 	}
-
-	translated := r.toStandard(string(content))
-	ctx := r.mergedContext(extra)
-	if err := r.checkUndefined(translated, ctx); err != nil {
-		return fmt.Errorf("rendering template %s: %w", srcPath, err)
-	}
-	tpl, err := r.tplSet.FromString(translated)
-	if err != nil {
-		return fmt.Errorf("parsing template %s: %w", srcPath, err)
-	}
-
-	result, err := tpl.Execute(ctx)
+	result, state, err := r.render(string(content), extra)
 	if err != nil {
 		return fmt.Errorf("rendering template %s: %w", srcPath, err)
 	}
+	if state.set {
+		return fmt.Errorf("%w: %s", ErrYieldInFile, srcPath)
+	}
 
-	// Restore any protected standard delimiters in the output.
-	result = r.fromStandard(result)
-
-	// Preserve source file permissions.
 	info, err := os.Stat(srcPath)
 	if err != nil {
 		return err
 	}
-
 	mode := info.Mode().Perm()
 	if err := os.WriteFile(dstPath, []byte(result), mode); err != nil {
 		return err
@@ -175,41 +345,121 @@ func (r *Renderer) RenderFile(srcPath, dstPath string, extra map[string]any) err
 	return os.Chmod(dstPath, mode)
 }
 
-// RenderPath renders a path string, expanding template expressions in path segments.
-// Returns all expanded paths (multiple if yield tags are used).
-func (r *Renderer) RenderPath(pathTemplate string, extra map[string]any) ([]string, error) {
-	parts := strings.Split(pathTemplate, string(filepath.Separator))
-	return r.renderPathParts(parts, extra)
+// RenderedPath is one rendered destination path with the extra context that
+// produced it (yield loop variables).
+type RenderedPath struct {
+	Path    string
+	Context map[string]any
 }
 
-func (r *Renderer) renderPathParts(parts []string, extra map[string]any) ([]string, error) {
+// RenderPath renders a path string, expanding template expressions in path
+// segments. Returns all expanded paths (multiple if yield tags are used).
+func (r *Renderer) RenderPath(pathTemplate string, extra map[string]any) ([]string, error) {
+	rendered, err := r.RenderPathParts(strings.Split(filepath.ToSlash(pathTemplate), "/"), extra, nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rendered))
+	for _, rp := range rendered {
+		out = append(out, rp.Path)
+	}
+	return out, nil
+}
+
+// RenderPathParts renders path segments recursively. specialCase, when given,
+// may short-circuit a rendered segment (used for the answers file path).
+func (r *Renderer) RenderPathParts(parts []string, extra map[string]any, specialCase func(rendered string, renderedSoFar []string) (string, bool)) ([]RenderedPath, error) {
+	return r.renderPathParts(parts, nil, extra, nil, specialCase)
+}
+
+func (r *Renderer) renderPathParts(parts, renderedParts []string, extra map[string]any, sourceParts []string, specialCase func(string, []string) (string, bool)) ([]RenderedPath, error) {
 	if len(parts) == 0 {
-		return []string{""}, nil
+		return []RenderedPath{{Path: filepath.Join(renderedParts...), Context: extra}}, nil
 	}
+	part, rest := parts[0], parts[1:]
+	sourceParts = append(append([]string(nil), sourceParts...), part)
+	sourcePath := path.Join(sourceParts...)
 
-	rendered, err := r.RenderString(parts[0], extra)
+	rendered, state, err := r.render(part, extra)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error rendering template path %s: %w", sourcePath, err)
 	}
 
-	if rendered == "" {
-		return nil, nil // path segment rendered to empty → skip
+	if state.set {
+		var out []RenderedPath
+		for _, value := range state.Iterable {
+			newCtx := make(map[string]any, len(extra)+1)
+			for k, v := range extra {
+				newCtx[k] = v
+			}
+			newCtx[state.Name] = value
+			renderedItem, _, err := r.render(part, newCtx)
+			if err != nil {
+				return nil, fmt.Errorf("error rendering template path %s: %w", sourcePath, err)
+			}
+			if specialCase != nil {
+				if full, ok := specialCase(renderedItem, renderedParts); ok {
+					out = append(out, RenderedPath{Path: full, Context: newCtx})
+					continue
+				}
+			}
+			if renderedItem == "" {
+				continue
+			}
+			sub, err := r.renderPathParts(rest, append(append([]string(nil), renderedParts...), renderedItem), newCtx, sourceParts, specialCase)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sub...)
+		}
+		return out, nil
 	}
 
-	rest, err := r.renderPathParts(parts[1:], extra)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]string, 0, len(rest))
-	for _, suffix := range rest {
-		if suffix == "" {
-			result = append(result, rendered)
-		} else {
-			result = append(result, filepath.Join(rendered, suffix))
+	if specialCase != nil {
+		if full, ok := specialCase(rendered, renderedParts); ok {
+			return []RenderedPath{{Path: full, Context: extra}}, nil
 		}
 	}
-	return result, nil
+	if rendered == "" {
+		return nil, nil
+	}
+	return r.renderPathParts(rest, append(append([]string(nil), renderedParts...), rendered), extra, sourceParts, specialCase)
+}
+
+var jinjaCommentRe = regexp.MustCompile(`(?s)\{#(-?)(.*?)(-?)#\}`)
+
+// stripJinjaComments removes `{# ... #}` comments the way Jinja2 does,
+// including multi-line ones (which pongo2's lexer rejects) and the `{#-` /
+// `-#}` whitespace control markers. Raw blocks are protected beforehand.
+func stripJinjaComments(s string) string {
+	if !strings.Contains(s, "{#") {
+		return s
+	}
+	matches := jinjaCommentRe.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return s
+	}
+	var b strings.Builder
+	pos := 0
+	trimNext := false
+	for _, m := range matches {
+		before := s[pos:m[0]]
+		if trimNext {
+			before = strings.TrimLeft(before, " \t\r\n")
+		}
+		if s[m[2]:m[3]] == "-" {
+			before = strings.TrimRight(before, " \t\r\n")
+		}
+		b.WriteString(before)
+		trimNext = s[m[6]:m[7]] == "-"
+		pos = m[1]
+	}
+	rest := s[pos:]
+	if trimNext {
+		rest = strings.TrimLeft(rest, " \t\r\n")
+	}
+	b.WriteString(rest)
+	return b.String()
 }
 
 // Unicode Private Use Area placeholders for protecting standard delimiters
@@ -270,31 +520,175 @@ func (r *Renderer) fromStandard(s string) string {
 	return s
 }
 
+// identifierRe matches the context keys pongo2 accepts; other keys (e.g.
+// `my-var`) cannot be referenced from templates and are left out.
+var identifierRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
 // mergedContext returns a new context combining the base context with extras.
 func (r *Renderer) mergedContext(extra map[string]any) pongo2.Context {
-	ctx := make(pongo2.Context, len(r.baseCtx)+len(extra))
+	ctx := make(pongo2.Context, len(r.baseCtx)+len(extra)+1)
 	for k, v := range r.baseCtx {
-		ctx[k] = v
+		if identifierRe.MatchString(k) {
+			ctx[k] = v
+		}
 	}
 	for k, v := range extra {
-		ctx[k] = v
+		if identifierRe.MatchString(k) {
+			ctx[k] = v
+		}
 	}
 	return ctx
 }
 
-var variableTagRe = regexp.MustCompile(`(?s)\{\{\s*([A-Za-z_][A-Za-z0-9_]*)`)
+var (
+	variableTagRe  = regexp.MustCompile(`(?s)\{\{\s*(?:not\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
+	conditionTagRe = regexp.MustCompile(`(?s)\{%-?\s*(?:if|elif)\s+(?:not\s+)?([A-Za-z_][A-Za-z0-9_]*)`)
+	boundNamesRes  = []*regexp.Regexp{
+		regexp.MustCompile(`(?s)\{%-?\s*for\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)\s+in\b`),
+		regexp.MustCompile(`(?s)\{%-?\s*set\s+([A-Za-z_][A-Za-z0-9_]*)`),
+		regexp.MustCompile(`(?s)\{%-?\s*yield\s+([A-Za-z_][A-Za-z0-9_]*)\s+from\b`),
+		regexp.MustCompile(`(?s)\{%-?\s*macro\s+([A-Za-z_][A-Za-z0-9_]*)`),
+		regexp.MustCompile(`(?s)\{%-?\s*with\s+(.*?)-?%\}`),
+	}
+	pongoLiterals = map[string]bool{
+		"true": true, "false": true, "nil": true, "none": true, "None": true, "True": true, "False": true,
+		"loop": true, "forloop": true, "not": true, "and": true, "or": true, "in": true,
+	}
+)
 
+// checkUndefined approximates Jinja's StrictUndefined: any top-level variable
+// referenced in an expression must exist in the context.
 func (r *Renderer) checkUndefined(template string, ctx pongo2.Context) error {
 	if !r.strictUndefined {
 		return nil
 	}
-	for _, match := range variableTagRe.FindAllStringSubmatch(template, -1) {
-		name := match[1]
+	bound := make(map[string]bool)
+	for _, re := range boundNamesRes {
+		for _, m := range re.FindAllStringSubmatch(template, -1) {
+			for _, part := range strings.FieldsFunc(m[1], func(r rune) bool { return r == ',' || r == ' ' || r == '=' || r == '\t' || r == '\n' }) {
+				bound[part] = true
+			}
+		}
+	}
+	check := func(name string) error {
+		if pongoLiterals[name] || bound[name] {
+			return nil
+		}
 		if _, ok := ctx[name]; !ok {
-			return fmt.Errorf("%q is undefined", name)
+			return fmt.Errorf("'%s' is undefined", name)
+		}
+		return nil
+	}
+	for _, match := range variableTagRe.FindAllStringSubmatch(template, -1) {
+		if err := check(match[1]); err != nil {
+			return err
+		}
+	}
+	for _, match := range conditionTagRe.FindAllStringSubmatch(template, -1) {
+		if err := check(match[1]); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// --- yield tag ------------------------------------------------------------
+
+type tagYieldNode struct {
+	name     string
+	iterable pongo2.IEvaluator
+	wrapper  *pongo2.NodeWrapper
+}
+
+func (node *tagYieldNode) Execute(ctx *pongo2.ExecutionContext, writer pongo2.TemplateWriter) *pongo2.Error {
+	state, _ := ctx.Public[yieldStateKey].(*yieldState)
+	if state == nil {
+		return ctx.Error("yield tag is not available in this context", nil)
+	}
+	if state.set {
+		return ctx.OrigError(fmt.Errorf("%w: a yield tag with the name %q already exists", ErrMultipleYields, state.Name), nil)
+	}
+	val, err := node.iterable.Evaluate(ctx)
+	if err != nil {
+		return err
+	}
+	state.set = true
+	state.Name = node.name
+	state.Iterable = iterableValues(val.Interface())
+	child := pongo2.NewChildExecutionContext(ctx)
+	return node.wrapper.Execute(child, writer)
+}
+
+func iterableValues(v any) []any {
+	if v == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = rv.Index(i).Interface()
+		}
+		return out
+	case reflect.Map:
+		keys := rv.MapKeys()
+		strs := make([]string, 0, len(keys))
+		byStr := make(map[string]any, len(keys))
+		for _, k := range keys {
+			s := fmt.Sprintf("%v", k.Interface())
+			strs = append(strs, s)
+			byStr[s] = k.Interface()
+		}
+		sort.Strings(strs)
+		out := make([]any, 0, len(strs))
+		for _, s := range strs {
+			out = append(out, byStr[s])
+		}
+		return out
+	case reflect.String:
+		s := rv.String()
+		out := make([]any, 0, len(s))
+		for _, r := range s {
+			out = append(out, string(r))
+		}
+		return out
+	}
+	return []any{v}
+}
+
+func tagYieldParser(doc *pongo2.Parser, start *pongo2.Token, arguments *pongo2.Parser) (pongo2.INodeTag, *pongo2.Error) {
+	node := &tagYieldNode{}
+	nameToken := arguments.MatchType(pongo2.TokenIdentifier)
+	if nameToken == nil {
+		return nil, arguments.Error("Expected an identifier after 'yield'.", nil)
+	}
+	node.name = nameToken.Val
+	if arguments.Match(pongo2.TokenIdentifier, "from") == nil && arguments.Match(pongo2.TokenKeyword, "from") == nil {
+		return nil, arguments.Error("Expected 'from' after the yield variable name.", nil)
+	}
+	iterable, err := arguments.ParseExpression()
+	if err != nil {
+		return nil, err
+	}
+	node.iterable = iterable
+	if arguments.Remaining() > 0 {
+		return nil, arguments.Error("Malformed 'yield'-tag arguments.", nil)
+	}
+	wrapper, endargs, err := doc.WrapUntilTag("endyield")
+	if err != nil {
+		return nil, err
+	}
+	if endargs.Count() > 0 {
+		return nil, endargs.Error("Arguments not allowed here.", nil)
+	}
+	node.wrapper = wrapper
+	return node, nil
+}
+
+// pathJoin joins path segments with forward slashes (the `pathjoin` global).
+func pathJoin(parts ...string) string {
+	return path.Join(parts...)
 }
 
 // IsBinary performs a simple heuristic to detect binary files by checking
@@ -311,12 +705,7 @@ func IsBinary(path string) (bool, error) {
 	if err != nil && err != io.EOF {
 		return false, err
 	}
-	for _, b := range buf[:n] {
-		if b == 0 {
-			return true, nil
-		}
-	}
-	return false, nil
+	return bytes.IndexByte(buf[:n], 0) >= 0, nil
 }
 
 // IsTemplateSuffix reports whether the file path ends with the template suffix.

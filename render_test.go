@@ -1,6 +1,7 @@
 package copier
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -124,5 +125,117 @@ func TestRenderer_RenderPath(t *testing.T) {
 	}
 	if len(paths) != 1 || paths[0] != filepath.Join("src", "main.go") {
 		t.Fatalf("expected [src/main.go], got %v", paths)
+	}
+}
+
+func TestRenderer_Filters(t *testing.T) {
+	r := NewRenderer(map[string]any{
+		"d":      map[string]any{"b": 2, "a": []any{1, "x"}},
+		"items":  []any{3, 1, 2},
+		"nested": []any{1, []any{2, []any{3}}},
+		"s":      "  Hello  ",
+	}, "")
+	cases := map[string]string{
+		`{{ d|to_json }}`:               `{"a":[1,"x"],"b":2}`,
+		`{{ d|to_nice_yaml }}`:          "a:\n    - 1\n    - x\nb: 2\n",
+		`{{ items|sort|join:"," }}`:     "1,2,3",
+		`{{ items|max }}`:               "3",
+		`{{ s|trim }}`:                  "Hello",
+		`{{ "abc"|hash:"sha256" }}`:     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+		`{{ "aGk="|b64decode }}`:        "hi",
+		`{{ "3"|int }}`:                 "3",
+		`{{ "yes"|bool }}`:              "True",
+		`{{ "a/b/c.txt"|basename }}`:    "c.txt",
+		`{{ "a/b/c.txt"|dirname }}`:     "a/b",
+		`{{ nested|flatten|join:"-" }}`: "1-2-3",
+		`{{ d|dict2items|length }}`:     "2",
+		`{{ "x y"|quote }}`:             "'x y'",
+		`{{ pathjoin("a", "b/c") }}`:    "a/b/c",
+	}
+	for tpl, want := range cases {
+		got, err := r.RenderString(tpl, map[string]any{"pathjoin": pathJoin})
+		if err != nil {
+			t.Errorf("%s: %v", tpl, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: got %q, want %q", tpl, got, want)
+		}
+	}
+	year, err := r.RenderString(`{{ "%Y-%m-%d"|strftime }}`, nil)
+	if err != nil || len(year) != 10 {
+		t.Errorf("strftime: %q %v", year, err)
+	}
+}
+
+func TestRenderer_StrictUndefinedAllowsLoopVars(t *testing.T) {
+	r := NewRenderer(map[string]any{"items": []any{"a", "b"}}, "", Envops{Undefined: "jinja2.StrictUndefined"})
+	out, err := r.RenderString("{% for x in items %}{{ x }}{% endfor %}{% set y = 1 %}{{ y }}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "ab1" {
+		t.Fatalf("unexpected output %q", out)
+	}
+	if _, err := r.RenderString("{% if missing %}x{% endif %}", nil); err == nil {
+		t.Fatal("expected strict undefined error in condition")
+	}
+}
+
+func TestRenderer_YieldPathParts(t *testing.T) {
+	r := NewRenderer(nil, "")
+	paths, err := r.RenderPath("{% yield n from names %}{{ n }}{% endyield %}/file.txt", map[string]any{"names": []any{"a", "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 || paths[0] != filepath.Join("a", "file.txt") || paths[1] != filepath.Join("b", "file.txt") {
+		t.Fatalf("unexpected yield paths: %v", paths)
+	}
+	_, _, err = r.RenderStringYield("{% yield a from x %}{% endyield %}{% yield b from x %}{% endyield %}", map[string]any{"x": []any{1}})
+	if !errors.Is(err, ErrMultipleYields) {
+		t.Fatalf("expected ErrMultipleYields, got %v", err)
+	}
+}
+
+func TestRenderer_SkipsNonIdentifierKeys(t *testing.T) {
+	r := NewRenderer(map[string]any{"my-var": 1, "ok": "fine"}, "")
+	out, err := r.RenderString("{{ ok }}", map[string]any{"other-key": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "fine" {
+		t.Fatalf("unexpected output %q", out)
+	}
+}
+
+func TestRenderer_MultilineComments(t *testing.T) {
+	r := NewRenderer(map[string]any{"x": "v"}, "")
+	tpl := "a\n{# first line\n   second line #}\nb {{ x }}{#- trimmed -#}   c\n{% raw %}{# kept #} ${{ x }} {% for %}{% endraw %}"
+	out, err := r.RenderString(tpl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "a\n\nb vc\n{# kept #} ${{ x }} {% for %}"; out != want {
+		t.Fatalf("got %q, want %q", out, want)
+	}
+	// Raw blocks with custom delimiters keep their content verbatim.
+	rc := NewRenderer(map[string]any{"x": "v"}, "", Envops{BlockStartString: "<%", BlockEndString: "%>", VariableStartString: "<<", VariableEndString: ">>"})
+	out, err = rc.RenderString("<< x >>|<% raw %><< x >> {{ y }}<% endraw %>", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "v|<< x >> {{ y }}"; out != want {
+		t.Fatalf("got %q, want %q", out, want)
+	}
+}
+
+func TestRenderer_LoopAliases(t *testing.T) {
+	r := NewRenderer(map[string]any{"items": []any{"a", "b", "c"}}, "")
+	out, err := r.RenderString("{% for i in items %}{{ loop.index }}{{ i }}{% if loop.last %}!{% endif %}{% endfor %}", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "1a2b3c!" {
+		t.Fatalf("unexpected output %q", out)
 	}
 }

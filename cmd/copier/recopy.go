@@ -16,7 +16,7 @@ func newRecopyCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "recopy [DESTINATION]",
-		Short: "Recopy a project from its template using existing answers",
+		Short: "Recopy the template without updating",
 		Long:  "Re-apply the template discarding project evolution, keeping previous answers.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -25,7 +25,10 @@ func newRecopyCmd() *cobra.Command {
 				dst = args[0]
 			}
 
-			opts := flags.options()
+			opts, err := flags.options()
+			if err != nil {
+				return err
+			}
 			if force {
 				defaults = true
 				overwrite = true
@@ -40,10 +43,10 @@ func newRecopyCmd() *cobra.Command {
 	}
 
 	flags.register(cmd)
-	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers")
-	cmd.Flags().BoolVarP(&overwrite, "overwrite", "w", false, "overwrite existing files")
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "shortcut for --defaults --overwrite")
-	cmd.Flags().BoolVarP(&skipAnswered, "skip-answered", "A", false, "skip previously answered questions")
+	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers to questions, which might be null if not specified")
+	cmd.Flags().BoolVarP(&overwrite, "overwrite", "w", false, "overwrite files that already exist, without asking")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "same as `--defaults --overwrite`")
+	cmd.Flags().BoolVarP(&skipAnswered, "skip-answered", "A", false, "skip questions that have already been answered")
 
 	return cmd
 }

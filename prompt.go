@@ -1,45 +1,56 @@
 package copier
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 )
 
-// TerminalPrompter implements Prompter using charmbracelet/huh for terminal UI.
+// TerminalPrompter implements Prompter using charm.land/huh/v2 for terminal UI.
 type TerminalPrompter struct{}
 
 // NewTerminalPrompter creates a new terminal prompter.
 func NewTerminalPrompter() *TerminalPrompter { return &TerminalPrompter{} }
 
-// Ask prompts the user for an answer to the given question.
-func (p *TerminalPrompter) Ask(q QuestionDef, currentAnswers map[string]any) (any, error) {
+// Ask prompts the user for an answer to the given question and returns the
+// parsed, validated answer.
+func (p *TerminalPrompter) Ask(q *Question) (any, error) {
 	if !isInteractive() {
 		return nil, ErrInteractiveNeeded
 	}
+	typeName, err := q.TypeName()
+	if err != nil {
+		return nil, err
+	}
+	choices, err := q.Choices()
+	if err != nil {
+		return nil, err
+	}
+	title := q.Message()
+	description := q.Placeholder()
 
 	switch {
-	case q.Type == TypeBool:
-		return p.askBool(q)
-	case q.Choices != nil:
-		return p.askChoice(q, currentAnswers)
-	case q.Secret:
-		return p.askSecret(q)
-	case q.Type == TypePath:
-		return p.askText(q) // path is just text input
+	case len(choices) > 0 && q.Def.Multiselect:
+		return p.askMultiSelect(q, title, description, choices)
+	case len(choices) > 0:
+		return p.askSelect(q, title, description, choices)
+	case typeName == "bool":
+		return p.askBool(q, title, description)
 	default:
-		return p.askText(q)
+		return p.askText(q, title, typeName)
 	}
 }
 
 // Confirm asks a yes/no question.
 func (p *TerminalPrompter) Confirm(message string, defaultVal bool) (bool, error) {
 	if !isInteractive() {
-		return defaultVal, nil
+		return false, ErrInteractiveNeeded
 	}
-	var result bool
+	result := defaultVal
 	err := huh.NewConfirm().
 		Title(message).
 		Value(&result).
@@ -47,176 +58,177 @@ func (p *TerminalPrompter) Confirm(message string, defaultVal bool) (bool, error
 		Negative("No").
 		Run()
 	if err != nil {
-		return false, err
+		return false, wrapPromptError(err)
 	}
 	return result, nil
 }
 
-func (p *TerminalPrompter) askBool(q QuestionDef) (any, error) {
-	var result bool
-	if d, ok := q.Default.(bool); ok {
-		result = d
+func wrapPromptError(err error) error {
+	if errors.Is(err, huh.ErrUserAborted) {
+		return ErrInterrupted
 	}
+	return err
+}
 
-	title := q.Name
-	if q.Help != "" {
-		title = q.Help
+func (p *TerminalPrompter) askBool(q *Question, title, description string) (any, error) {
+	result := false
+	if def, present, err := q.Default(); err != nil {
+		return nil, err
+	} else if present {
+		result = castToBool(def)
 	}
-
 	err := huh.NewConfirm().
 		Title(title).
-		Description(q.Placeholder).
+		Description(description).
 		Value(&result).
 		Run()
 	if err != nil {
-		return nil, err
+		return nil, wrapPromptError(err)
 	}
-	return result, nil
+	return q.ParseAnswer(result)
 }
 
-func (p *TerminalPrompter) askText(q QuestionDef) (any, error) {
+func (p *TerminalPrompter) askText(q *Question, title, typeName string) (any, error) {
 	var result string
-	if q.Default != nil {
-		result = fmt.Sprintf("%v", q.Default)
-	}
-
-	title := q.Name
-	if q.Help != "" {
-		title = q.Help
-	}
-
-	input := huh.NewInput().
-		Title(title).
-		Placeholder(q.Placeholder).
-		Value(&result)
-
-	if err := input.Run(); err != nil {
+	if def, present, err := q.DefaultRendered(); err != nil {
 		return nil, err
+	} else if present {
+		result = fmt.Sprintf("%v", def)
+	}
+	validate := func(s string) error {
+		parsed, err := q.ParseAnswer(s)
+		if err != nil {
+			return errors.New("invalid input")
+		}
+		return q.ValidateAnswer(parsed)
 	}
 
-	return ParseAnswer(q, result)
-}
-
-func (p *TerminalPrompter) askSecret(q QuestionDef) (any, error) {
-	var result string
-	if q.Default != nil {
-		result = fmt.Sprintf("%v", q.Default)
+	if q.Def.Secret {
+		err := huh.NewInput().
+			Title(title).
+			EchoMode(huh.EchoModePassword).
+			Value(&result).
+			Validate(validate).
+			Run()
+		if err != nil {
+			return nil, wrapPromptError(err)
+		}
+		return q.ParseAnswer(result)
 	}
 
-	title := q.Name
-	if q.Help != "" {
-		title = q.Help
+	if q.Multiline() {
+		err := huh.NewText().
+			Title(title).
+			Placeholder(q.Placeholder()).
+			Value(&result).
+			Validate(validate).
+			Run()
+		if err != nil {
+			return nil, wrapPromptError(err)
+		}
+		return q.ParseAnswer(result)
 	}
 
-	input := huh.NewInput().
+	err := huh.NewInput().
 		Title(title).
-		EchoMode(huh.EchoModePassword).
-		Value(&result)
-
-	if err := input.Run(); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (p *TerminalPrompter) askChoice(q QuestionDef, currentAnswers map[string]any) (any, error) {
-	choices := resolveChoices(q)
-	if len(choices) == 0 {
-		return p.askText(q)
-	}
-
-	title := q.Name
-	if q.Help != "" {
-		title = q.Help
-	}
-
-	if q.Multiselect {
-		return p.askMultiSelect(title, choices, q)
-	}
-
-	options := make([]huh.Option[string], 0, len(choices))
-	for _, ch := range choices {
-		options = append(options, huh.NewOption(ch.Label, ch.Value))
-	}
-
-	var result string
-	if q.Default != nil {
-		result = fmt.Sprintf("%v", q.Default)
-	}
-
-	err := huh.NewSelect[string]().
-		Title(title).
-		Options(options...).
+		Placeholder(q.Placeholder()).
 		Value(&result).
+		Validate(validate).
 		Run()
 	if err != nil {
+		return nil, wrapPromptError(err)
+	}
+	return q.ParseAnswer(result)
+}
+
+func choiceLabel(c Choice) string {
+	if c.Disabled != "" {
+		return fmt.Sprintf("%s (%s)", c.Name, c.Disabled)
+	}
+	return c.Name
+}
+
+func (p *TerminalPrompter) askSelect(q *Question, title, description string, choices []Choice) (any, error) {
+	options := make([]huh.Option[int], 0, len(choices))
+	for i, c := range choices {
+		options = append(options, huh.NewOption(choiceLabel(c), i))
+	}
+	selected := 0
+	if def, present, err := q.Default(); err != nil {
 		return nil, err
-	}
-
-	return ParseAnswer(q, result)
-}
-
-func (p *TerminalPrompter) askMultiSelect(title string, choices []choiceEntry, q QuestionDef) (any, error) {
-	options := make([]huh.Option[string], 0, len(choices))
-	for _, ch := range choices {
-		options = append(options, huh.NewOption(ch.Label, ch.Value))
-	}
-
-	var results []string
-	err := huh.NewMultiSelect[string]().
-		Title(title).
-		Options(options...).
-		Value(&results).
-		Run()
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert string results to the appropriate types.
-	parsed := make([]any, 0, len(results))
-	for _, r := range results {
-		v, parseErr := ParseAnswer(q, r)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		parsed = append(parsed, v)
-	}
-	return parsed, nil
-}
-
-type choiceEntry struct {
-	Label string
-	Value string
-}
-
-func resolveChoices(q QuestionDef) []choiceEntry {
-	switch v := q.Choices.(type) {
-	case []any:
-		entries := make([]choiceEntry, 0, len(v))
-		for _, item := range v {
-			s := fmt.Sprintf("%v", item)
-			entries = append(entries, choiceEntry{Label: s, Value: s})
-		}
-		return entries
-	case map[string]any:
-		entries := make([]choiceEntry, 0, len(v))
-		for label, val := range v {
-			entries = append(entries, choiceEntry{Label: label, Value: fmt.Sprintf("%v", val)})
-		}
-		return entries
-	case string:
-		// Jinja-rendered choices — split by newlines.
-		lines := strings.Split(v, "\n")
-		entries := make([]choiceEntry, 0, len(lines))
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" {
-				entries = append(entries, choiceEntry{Label: line, Value: line})
+	} else if present {
+		for i, c := range choices {
+			cv, err := q.CastAnswer(c.Value)
+			if err == nil && reflect.DeepEqual(cv, def) {
+				selected = i
+				break
 			}
 		}
-		return entries
 	}
-	return nil
+	err := huh.NewSelect[int]().
+		Title(title).
+		Description(description).
+		Options(options...).
+		Value(&selected).
+		Validate(func(i int) error {
+			if i >= 0 && i < len(choices) && choices[i].Disabled != "" {
+				return errors.New(choices[i].Disabled)
+			}
+			return nil
+		}).
+		Run()
+	if err != nil {
+		return nil, wrapPromptError(err)
+	}
+	return q.ParseAnswer(choices[selected].Value)
+}
+
+func (p *TerminalPrompter) askMultiSelect(q *Question, title, description string, choices []Choice) (any, error) {
+	options := make([]huh.Option[int], 0, len(choices))
+	for i, c := range choices {
+		options = append(options, huh.NewOption(choiceLabel(c), i))
+	}
+	var selected []int
+	if def, present, err := q.Default(); err != nil {
+		return nil, err
+	} else if present {
+		if defaults, ok := def.([]any); ok {
+			for i, c := range choices {
+				cv, err := q.CastAnswer(c.Value)
+				if err != nil {
+					continue
+				}
+				for _, d := range defaults {
+					if reflect.DeepEqual(cv, d) {
+						selected = append(selected, i)
+						break
+					}
+				}
+			}
+		}
+	}
+	err := huh.NewMultiSelect[int]().
+		Title(title).
+		Description(description).
+		Options(options...).
+		Value(&selected).
+		Validate(func(sel []int) error {
+			for _, i := range sel {
+				if i >= 0 && i < len(choices) && choices[i].Disabled != "" {
+					return errors.New(choices[i].Disabled)
+				}
+			}
+			return nil
+		}).
+		Run()
+	if err != nil {
+		return nil, wrapPromptError(err)
+	}
+	values := make([]any, 0, len(selected))
+	for _, i := range selected {
+		values = append(values, choices[i].Value)
+	}
+	return q.ParseAnswer(values)
 }
 
 func isInteractive() bool {
@@ -225,4 +237,13 @@ func isInteractive() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// resolveChoiceLabels is kept for callers that only need display labels.
+func resolveChoiceLabels(choices []Choice) []string {
+	out := make([]string, 0, len(choices))
+	for _, c := range choices {
+		out = append(out, strings.TrimSpace(c.Name))
+	}
+	return out
 }

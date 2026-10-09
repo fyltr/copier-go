@@ -9,6 +9,7 @@ func newUpdateCmd() *cobra.Command {
 	var (
 		flags        commonFlags
 		defaults     bool
+		force        bool
 		conflict     string
 		contextLines int
 		skipAnswered bool
@@ -16,18 +17,31 @@ func newUpdateCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "update [DESTINATION]",
-		Short: "Update a project to a newer template version",
-		Long:  "Smartly update a project by computing a 3-way diff between old template, current state, and new template.",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Update a subproject from its original template",
+		Long: `Update a subproject from its original template.
+
+The copy must have a valid answers file which contains info from the last
+Copier execution, including the source template (it must be a key called
+` + "`_src_path`" + `).
+
+If that file contains also ` + "`_commit`" + `, and DESTINATION is a git
+repository, this command will do its best to respect the diff that you have
+generated since the last copier execution. To avoid that, use ` + "`copier recopy`" + `
+instead.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dst := "."
 			if len(args) > 0 {
 				dst = args[0]
 			}
 
-			opts := flags.options()
+			opts, err := flags.options()
+			if err != nil {
+				return err
+			}
 			opts = append(opts,
-				copier.WithDefaults(defaults),
+				copier.WithDefaults(defaults || force),
+				copier.WithOverwrite(true),
 				copier.WithConflict(copier.ConflictStrategy(conflict)),
 				copier.WithContextLines(contextLines),
 				copier.WithSkipAnswered(skipAnswered),
@@ -37,10 +51,12 @@ func newUpdateCmd() *cobra.Command {
 	}
 
 	flags.register(cmd)
-	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers")
-	cmd.Flags().StringVarP(&conflict, "conflict", "o", "inline", "conflict strategy: inline or rej")
-	cmd.Flags().IntVarP(&contextLines, "context-lines", "c", 3, "number of diff context lines")
-	cmd.Flags().BoolVarP(&skipAnswered, "skip-answered", "A", false, "skip previously answered questions")
+	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers to questions, which might be null if not specified")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "same as `--defaults`")
+	_ = cmd.Flags().MarkHidden("force")
+	cmd.Flags().StringVarP(&conflict, "conflict", "o", "inline", "behavior on conflict: create .rej files, or add inline conflict markers (rej or inline)")
+	cmd.Flags().IntVarP(&contextLines, "context-lines", "c", 3, "lines of context to use for detecting conflicts; increase for accuracy, decrease for resilience")
+	cmd.Flags().BoolVarP(&skipAnswered, "skip-answered", "A", false, "skip questions that have already been answered")
 
 	return cmd
 }

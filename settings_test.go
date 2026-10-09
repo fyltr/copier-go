@@ -25,6 +25,53 @@ func TestSettings_IsTrusted(t *testing.T) {
 	}
 }
 
+func TestIsTrustedRepository_Normalization(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	type tc struct {
+		repo  string
+		trust []string
+		want  bool
+	}
+	var cases []tc
+	for _, base := range []string{"https://github.com", "ssh://git@github.com", "git@github.com:", "gh:", "gl:"} {
+		sep := "/"
+		if base == "git@github.com:" || base == "gh:" || base == "gl:" {
+			sep = ""
+		}
+		cases = append(cases,
+			tc{base + sep + "user/repo.git", nil, false},
+			tc{base + sep + "user/repo.git", []string{base + sep + "user/repo.git"}, true},
+			tc{base + sep + "user/repo", []string{base + sep + "user/repo.git"}, false},
+			tc{base + sep + "user/repo.git", []string{base + sep + "user/"}, true},
+			tc{base + sep + "user/repo.git", []string{base + sep + "user/repo"}, false},
+			tc{base + sep + "user/repo.git", []string{base + sep + "user"}, false},
+			tc{base + sep + "user/../evil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/../evil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
+			tc{base + sep + "user/%2e%2e/evil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/%2E%2E/evil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/.%2e/evil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user%2f%2e%2e%2fevil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/%2e%2e/evil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
+			tc{base + sep + "user/%2e%2e%5cevil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/..%5cevil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/..\\evil/repo.git", []string{base + sep + "user/"}, false},
+			tc{base + sep + "user/%2e%2e%5cevil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
+		)
+	}
+	cases = append(cases,
+		tc{home + "/trusted/../attacker/template", []string{home + "/trusted/"}, false},
+		tc{home + "/trusted/../attacker/template", []string{"~/trusted/"}, false},
+		tc{home + "/trusted/template", []string{"~/trusted/"}, true},
+		tc{"/tmp/tpl/", []string{"/tmp/tpl/"}, true},
+		tc{`C:\Users\me\tpl`, []string{`C:\Users\me\tpl`}, true},
+	)
+	for _, c := range cases {
+		if got := isTrustedRepository(c.trust, c.repo); got != c.want {
+			t.Errorf("isTrustedRepository(%v, %q) = %v, want %v (normalized %q)", c.trust, c.repo, got, c.want, normalizeTrustURL(c.repo))
+		}
+	}
+}
+
 func TestSettings_DefaultFor(t *testing.T) {
 	s := &Settings{Defaults: map[string]any{"name": "default-name"}}
 	v, ok := s.DefaultFor("name")

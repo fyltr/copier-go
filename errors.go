@@ -11,6 +11,7 @@ package copier
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Sentinel errors for type-checking with errors.Is.
@@ -29,6 +30,13 @@ var (
 	ErrMultipleYields     = errors.New("multiple yield tags in a single path segment")
 	ErrTaskFailed         = errors.New("task execution failed")
 	ErrInterrupted        = errors.New("operation interrupted by user")
+	ErrQuestionRequired   = errors.New("question is required")
+	ErrInvalidChoice      = errors.New("invalid choice")
+	ErrDirtyDestination   = errors.New("destination repository is dirty; cannot continue. Please commit or stash your local changes and retry")
+	ErrNotGitTracked      = errors.New("updating is only supported in git-tracked subprojects")
+	ErrVersionNotDetected = errors.New("template version not detected")
+	ErrDowngrade          = errors.New("downgrades are not supported")
+	ErrSettings           = errors.New("invalid settings")
 )
 
 // TemplateError wraps errors related to template loading or configuration.
@@ -69,8 +77,38 @@ type ValidationError struct {
 }
 
 func (e *ValidationError) Error() string {
-	return fmt.Sprintf("validation failed for %q: %s", e.Question, e.Message)
+	return fmt.Sprintf("Validation error for question '%s': %s", e.Question, e.Message)
 }
+
+// InvalidChoiceError is returned when an answer is not among the valid choices.
+type InvalidChoiceError struct {
+	Question string
+	Detail   string
+}
+
+func (e *InvalidChoiceError) Error() string {
+	return fmt.Sprintf("Invalid choice for '%s': %s", e.Question, e.Detail)
+}
+
+func (e *InvalidChoiceError) Unwrap() error { return ErrInvalidChoice }
+
+// UnsafeTemplateError reports which unsafe features a template uses.
+type UnsafeTemplateError struct {
+	Features []string
+}
+
+func (e *UnsafeTemplateError) Error() string {
+	s := ""
+	if len(e.Features) > 1 {
+		s = "s"
+	}
+	return fmt.Sprintf(
+		"Template uses potentially unsafe feature%s: %s.\n"+
+			"If you trust this template, consider adding the `--trust` option when running `copier copy/update`.",
+		s, strings.Join(e.Features, ", "))
+}
+
+func (e *UnsafeTemplateError) Unwrap() error { return ErrUnsafeTemplate }
 
 // InterruptError carries partial answers when the user interrupts a prompt session.
 type InterruptError struct {

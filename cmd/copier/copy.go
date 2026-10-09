@@ -16,11 +16,14 @@ func newCopyCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "copy TEMPLATE DESTINATION",
-		Short: "Copy a template to a new project",
+		Short: "Copy from a template source to a destination",
 		Long:  "Scaffold a new project from a template. TEMPLATE is a local path or Git URL.",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			opts := flags.options()
+			opts, err := flags.options()
+			if err != nil {
+				return err
+			}
 			if force {
 				defaults = true
 				overwrite = true
@@ -35,10 +38,10 @@ func newCopyCmd() *cobra.Command {
 	}
 
 	flags.register(cmd)
-	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers")
-	cmd.Flags().BoolVarP(&overwrite, "overwrite", "w", false, "overwrite existing files")
-	cmd.Flags().BoolVarP(&force, "force", "f", false, "shortcut for --defaults --overwrite")
-	cmd.Flags().BoolVarP(&noCleanup, "no-cleanup", "C", false, "do not delete destination on error")
+	cmd.Flags().BoolVarP(&defaults, "defaults", "l", false, "use default answers to questions, which might be null if not specified")
+	cmd.Flags().BoolVarP(&overwrite, "overwrite", "w", false, "overwrite files that already exist, without asking")
+	cmd.Flags().BoolVarP(&force, "force", "f", false, "same as `--defaults --overwrite`")
+	cmd.Flags().BoolVarP(&noCleanup, "no-cleanup", "C", false, "on error, do not delete destination if it was created by Copier")
 
 	return cmd
 }

@@ -20,8 +20,9 @@ func Copy(src, dst string, opts ...Option) error {
 	return w.runCopy()
 }
 
-// Update updates an existing project to a newer version of its template.
-// The destination must contain a .copier-answers.yml from a previous Copy.
+// Update updates an existing project to a newer version of its template using
+// a 3-way merge. The destination must be a git repository containing the
+// answers file from a previous Copy, and it must not have uncommitted changes.
 //
 //	err := copier.Update("./myproject",
 //	    copier.WithConflict(copier.ConflictInline),
@@ -45,28 +46,9 @@ func Recopy(dst string, opts ...Option) error {
 	cfg := applyOptions(opts)
 	cfg.DstPath = dst
 
-	// Load existing answers to find src.
-	answersPath := cfg.resolvedAnswersFile()
-	lastAnswers, err := LoadAnswersFile(answersPath)
-	if err != nil {
-		return err
-	}
-	if lastAnswers == nil {
-		return ErrConfig
-	}
-	if sp, ok := lastAnswers["_src_path"]; ok {
-		cfg.SrcPath = resolveStoredSourcePath(sp.(string), cfg.DstPath)
-	}
-
 	w, err := newWorker(cfg, OpCopy)
 	if err != nil {
 		return err
 	}
-
-	// Pre-load previous answers.
-	for k, v := range lastAnswers {
-		w.answers.Last[k] = v
-	}
-
-	return w.runCopy()
+	return w.runRecopy()
 }
