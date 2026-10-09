@@ -264,6 +264,103 @@ func TestCloneTemplate_RemoteMirrorCache(t *testing.T) {
 	}
 }
 
+// TestUpdate_RenamedDirDoesNotDeleteSymlinkTarget ports upstream's
+// test_update_renamed_dir_does_not_delete_symlink_target.
+func TestUpdate_RenamedDirDoesNotDeleteSymlinkTarget(t *testing.T) {
+	if !IsGitInstalled() {
+		t.Skip("git not installed")
+	}
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"copier.yml":                            "_preserve_symlinks: true\n\nname:\n    type: str\n",
+		"{{ _copier_conf.answers_file }}.jinja": answersTemplate,
+		"shared/templates/file.txt":             "test",
+	})
+	link := filepath.Join("..", "shared", "templates")
+	if err := os.MkdirAll(filepath.Join(src, "{{ name }}"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(link, filepath.Join(src, "{{ name }}", "templates")); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, src, "init", "-q")
+	gitSave(t, src, "v1") // Upstream updates untagged templates too (see README, Known Gaps).
+
+	if err := Copy(src, dst, WithQuiet(true), WithData(map[string]any{"name": "foo"})); err != nil {
+		t.Fatal(err)
+	}
+	assertLink := func(name string) {
+		t.Helper()
+		got, err := os.Readlink(filepath.Join(dst, name, "templates"))
+		if err != nil || got != link {
+			t.Fatalf("%s/templates: readlink = %q, %v; want %q", name, got, err, link)
+		}
+		if got := readFile(t, filepath.Join(dst, name, "templates", "file.txt")); got != "test" {
+			t.Fatalf("%s/templates/file.txt = %q", name, got)
+		}
+	}
+	assertLink("foo")
+	runGit(t, dst, "init", "-q")
+	gitSave(t, dst, "")
+
+	if err := Update(dst, WithQuiet(true), WithData(map[string]any{"name": "bar"}), WithOverwrite(true)); err != nil {
+		t.Fatal(err)
+	}
+	assertLink("bar")
+}
+
+// TestCloneTemplate_SubmoduleWithMovedURL ports upstream's
+// test_remote_clone_submodule_with_moved_url: submodules are resolved from each
+// checkout's own .gitmodules, not from URLs an earlier worktree registered in
+// the shared mirror config.
+func TestCloneTemplate_SubmoduleWithMovedURL(t *testing.T) {
+	if !IsGitInstalled() {
+		t.Skip("git not installed")
+	}
+	t.Setenv("COPIER_CACHE_DIR", t.TempDir())
+	// Local submodules need the file protocol, blocked by default since Git 2.38.1.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+	t.Setenv("GIT_CONFIG_VALUE_0", "always")
+
+	// The submodule, initially hosted in one place, later moves with a new commit.
+	sub1, sub2 := t.TempDir(), t.TempDir()
+	writeTree(t, sub1, map[string]string{"sub.txt": "v1"})
+	runGit(t, sub1, "init", "-q")
+	gitSave(t, sub1, "")
+	writeTree(t, sub2, map[string]string{"sub.txt": "v2"})
+	runGit(t, sub2, "init", "-q")
+	gitSave(t, sub2, "")
+
+	template := t.TempDir()
+	writeTree(t, template, map[string]string{"README.md": "template"})
+	runGit(t, template, "init", "-q")
+	gitSave(t, template, "")
+	runGit(t, template, "submodule", "add", "-q", sub1, "sub")
+	gitSave(t, template, "v1")
+	gitmodules := filepath.Join(template, ".gitmodules")
+	writeTree(t, template, map[string]string{".gitmodules": strings.ReplaceAll(readFile(t, gitmodules), sub1, sub2)})
+	runGit(t, filepath.Join(template, "sub"), "fetch", "-q", sub2)
+	runGit(t, filepath.Join(template, "sub"), "checkout", "-q", "FETCH_HEAD")
+	gitSave(t, template, "v2")
+
+	repo := resolveRepo("git+file://" + template)
+	for _, tc := range []struct{ ref, want string }{{"v1", "v1"}, {"v2", "v2"}} {
+		co, err := cloneTemplate(repo, tc.ref, false)
+		if err != nil {
+			t.Fatalf("cloning %s: %v", tc.ref, err)
+		}
+		t.Cleanup(func() {
+			removeWorktree(co.mirror, co.path)
+			_ = os.RemoveAll(co.path)
+		})
+		if got := readFile(t, filepath.Join(co.path, "sub", "sub.txt")); got != tc.want {
+			t.Fatalf("%s: submodule content = %q, want %q", tc.ref, got, tc.want)
+		}
+	}
+}
+
 func TestCopy_LocalDirtyTemplateIncluded(t *testing.T) {
 	if !IsGitInstalled() {
 		t.Skip("git not installed")

@@ -241,6 +241,7 @@ type QuestionDef struct {
 	Placeholder string
 	Validator   string
 	When        any // bool or string (Jinja condition); nil means true
+	Ask         any // bool or string (Jinja condition); nil means true
 	Qmark       string
 }
 
@@ -539,6 +540,9 @@ func fillQuestionDef(q *QuestionDef, m map[string]any) {
 	}
 	if v, ok := m["when"]; ok {
 		q.When = v
+	}
+	if v, ok := m["ask"]; ok {
+		q.Ask = v
 	}
 	if v, ok := m["qmark"]; ok && v != nil {
 		q.Qmark = fmt.Sprintf("%v", v)

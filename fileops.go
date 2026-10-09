@@ -341,7 +341,9 @@ func removeOldFiles(prefix string, cmp *dirComparison, rmCommon bool) {
 	for _, name := range toRm {
 		target := filepath.Join(prefix, name)
 		info, err := os.Lstat(target)
-		if err != nil {
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			// Symlinks are kept, so a renamed directory containing one never
+			// deletes files through it.
 			continue
 		}
 		if !info.IsDir() {
@@ -360,6 +362,9 @@ func removeOldFiles(prefix string, cmp *dirComparison, rmCommon bool) {
 			continue
 		}
 		subdir := filepath.Join(prefix, name)
+		if isSymlinkPath(subdir) {
+			continue
+		}
 		removeOldFiles(subdir, sub, false)
 		_ = os.Remove(subdir) // Only succeeds when empty.
 	}

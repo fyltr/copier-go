@@ -426,6 +426,13 @@ func cloneViaCache(ref, location, mirror string) error {
 	if _, err := gitRun("", "--git-dir", mirror, "worktree", "add", "--detach", "--force", location, ref); err != nil {
 		return fmt.Errorf("checking out %s: %w", ref, err)
 	}
+	// Worktrees share the mirror's config, so `git submodule update --init`
+	// from an earlier checkout may have registered `submodule.<name>.url`
+	// entries that override the current `.gitmodules` (e.g. after a submodule
+	// moved to a new repository). Synchronizing the URLs uses the current one.
+	if _, err := gitRun(location, "submodule", "sync", "--recursive"); err != nil {
+		return err
+	}
 	if _, err := gitRun(location, "submodule", "update", "--checkout", "--init", "--recursive", "--force"); err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -695,5 +696,337 @@ func TestQuestion_CastSemantics(t *testing.T) {
 	unset := mk(QuestionDef{Name: "u", Type: "str", Default: "{{ UNSET }}", HasDefault: true})
 	if _, present, err := unset.Default(); err != nil || present {
 		t.Errorf("UNSET default should be missing, present=%v err=%v", present, err)
+	}
+}
+
+const validatorTemplate = `
+runtime_mode:
+    type: str
+    choices: [process, docker]
+    default: process
+serve_mode:
+    type: str
+    default: development
+    validator: "{% if serve_mode == 'production' and runtime_mode == 'process' %}production requires runtime_mode=docker{% endif %}"
+operator_home:
+    type: str
+    default: relative/home
+    validator: "{% if operator_home|first != '/' %}must be an absolute path{% endif %}"
+`
+
+func requireValidationError(t *testing.T, err error, question, message string) {
+	t.Helper()
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
+	}
+	if ve.Question != question || ve.Message != message {
+		t.Fatalf("unexpected validation error: %+v", ve)
+	}
+	if want := "Validation error for question '" + question + "': " + message; err.Error() != want {
+		t.Fatalf("error message = %q, want %q", err.Error(), want)
+	}
+}
+
+// Answers given as data are validated like prompted ones, with or without
+// --defaults, like upstream `Worker._ask`.
+func TestCopy_ValidatorRunsOnDataAnswers(t *testing.T) {
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{"copier.yml": validatorTemplate, "out.txt.jinja": "{{ serve_mode }}:{{ operator_home }}"})
+	data := map[string]any{"serve_mode": "production", "operator_home": "/srv/op"}
+
+	dst := t.TempDir()
+	err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithData(data))
+	requireValidationError(t, err, "serve_mode", "production requires runtime_mode=docker")
+	if exists(filepath.Join(dst, "out.txt")) {
+		t.Fatal("nothing should be rendered after a validation error")
+	}
+
+	prompter := &scriptedPrompter{}
+	data["runtime_mode"] = "process"
+	err = Copy(src, t.TempDir(), WithQuiet(true), WithPrompter(prompter), WithData(data))
+	requireValidationError(t, err, "serve_mode", "production requires runtime_mode=docker")
+	if len(prompter.asked) != 0 {
+		t.Fatalf("data answers should not be prompted: %v", prompter.asked)
+	}
+
+	data["runtime_mode"] = "docker"
+	dst = t.TempDir()
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithData(data)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dst, "out.txt")); got != "production:/srv/op" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}
+
+// Under --defaults the default is validated, like upstream
+// `Question.get_default`.
+func TestCopy_ValidatorRunsOnDefaults(t *testing.T) {
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{"copier.yml": validatorTemplate, "out.txt.jinja": "{{ serve_mode }}:{{ operator_home }}"})
+
+	dst := t.TempDir()
+	err := Copy(src, dst, WithQuiet(true), WithDefaults(true))
+	requireValidationError(t, err, "operator_home", "must be an absolute path")
+
+	err = Copy(src, dst, WithQuiet(true), WithDefaults(true), WithUserDefaults(map[string]any{"operator_home": "relative/again"}))
+	requireValidationError(t, err, "operator_home", "must be an absolute path")
+
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithUserDefaults(map[string]any{"operator_home": "/srv/op"})); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dst, "out.txt")); got != "development:/srv/op" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}
+
+// A question skipped by `when` is not validated on its computed default, nor
+// is a secret question's default. An answer given as data for it still is,
+// like upstream.
+func TestCopy_ValidatorWhenFalseAndSecret(t *testing.T) {
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"copier.yml": `
+use_db:
+    type: bool
+    default: false
+db_name:
+    type: str
+    default: ""
+    when: "{{ use_db }}"
+    validator: "{% if not db_name %}db_name is required{% endif %}"
+token:
+    type: str
+    secret: true
+    default: ""
+    validator: "{% if not token %}token is required{% endif %}"
+`,
+		"out.txt.jinja": "[{{ db_name }}]",
+	})
+
+	dst := t.TempDir()
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dst, "out.txt")); got != "[]" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+	if answers := readFile(t, filepath.Join(dst, ".copier-answers.yml")); strings.Contains(answers, "db_name") {
+		t.Fatalf("skipped question recorded: %s", answers)
+	}
+
+	err := Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true), WithData(map[string]any{"db_name": ""}))
+	requireValidationError(t, err, "db_name", "db_name is required")
+
+	err = Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true), WithData(map[string]any{"use_db": true}))
+	requireValidationError(t, err, "db_name", "db_name is required")
+}
+
+// Previously recorded answers that no longer validate are dropped, so the
+// default (or a prompt) replaces them.
+func TestRecopy_InvalidLastAnswerDropped(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"copier.yml":                            "name:\n    type: str\n    default: fine\n    validator: \"{% if name == 'bad' %}bad name{% endif %}\"\n",
+		"{{ _copier_conf.answers_file }}.jinja": "{{ _copier_answers|to_nice_yaml }}",
+		"out.txt.jinja":                         "{{ name }}",
+	})
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithData(map[string]any{"name": "custom"})); err != nil {
+		t.Fatal(err)
+	}
+	answersPath := filepath.Join(dst, ".copier-answers.yml")
+	mustWriteFile(t, answersPath, []byte(strings.Replace(readFile(t, answersPath), "name: custom", "name: bad", 1)), 0o644)
+
+	if err := Recopy(dst, WithQuiet(true), WithDefaults(true), WithOverwrite(true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dst, "out.txt")); got != "fine" {
+		t.Fatalf("invalid recorded answer should be replaced by the default, got %q", got)
+	}
+}
+
+// TestCopy_KeepAnswerForUnaskQuestion ports upstream's
+// test_keep_answer_for_unask_question.
+func TestCopy_KeepAnswerForUnaskQuestion(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"copier.yml": `
+disabled:
+    type: str
+    ask: false
+
+disabled_with_default:
+    type: str
+    default: hello
+    ask: false
+`,
+		"{{ _copier_conf.answers_file }}.jinja": "{{ _copier_answers|to_nice_yaml }}",
+		"context.yml.jinja":                     "disabled: {{ disabled }}\ndisabled_with_default: {{ disabled_with_default }}\n",
+	})
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithData(map[string]any{"disabled": "hello"})); err != nil {
+		t.Fatal(err)
+	}
+	answers, err := LoadAnswersFile(filepath.Join(dst, ".copier-answers.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcPath, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answers["disabled"] != "hello" || answers["disabled_with_default"] != "hello" || answers["_src_path"] != srcPath || len(answers) != 3 {
+		t.Fatalf("unexpected answers: %v", answers)
+	}
+	if got := readFile(t, filepath.Join(dst, "context.yml")); got != "disabled: hello\ndisabled_with_default: hello\n" {
+		t.Fatalf("unexpected context: %q", got)
+	}
+}
+
+func askSettingTemplate(t *testing.T, when, ask bool) string {
+	t.Helper()
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"copier.yml":                            "foo:\n    type: str\n    default: bar\n    when: " + strconv.FormatBool(when) + "\n    ask: " + strconv.FormatBool(ask) + "\n",
+		"{{ _copier_conf.answers_file }}.jinja": "{{ _copier_answers|to_nice_yaml }}",
+	})
+	return src
+}
+
+// TestCopy_AskSetting ports upstream's test_copy_with_ask_setting.
+func TestCopy_AskSetting(t *testing.T) {
+	for _, tc := range []struct {
+		when, ask bool
+		askFlag   []string
+		prompted  bool
+	}{
+		{true, true, nil, true},
+		{true, true, []string{"foo"}, true},
+		{true, true, []string{"f*"}, true},
+		{true, true, []string{"baz"}, true},
+		{true, false, nil, false},
+		{true, false, []string{"foo"}, true},
+		{true, false, []string{"f*"}, true},
+		{true, false, []string{"baz"}, false},
+		{false, true, nil, false},
+		{false, true, []string{"foo"}, false},
+		{false, true, []string{"f*"}, false},
+		{false, true, []string{"baz"}, false},
+		{false, false, nil, false},
+		{false, false, []string{"foo"}, false},
+		{false, false, []string{"f*"}, false},
+		{false, false, []string{"baz"}, false},
+	} {
+		src := askSettingTemplate(t, tc.when, tc.ask)
+		dst := t.TempDir()
+		prompter := &scriptedPrompter{answers: map[string]any{"foo": "barx"}}
+		if err := Copy(src, dst, WithQuiet(true), WithPrompter(prompter), WithAsk(tc.askFlag...)); err != nil {
+			t.Fatal(err)
+		}
+		if prompted := len(prompter.asked) > 0; prompted != tc.prompted {
+			t.Errorf("when=%v ask=%v --ask=%v: prompted=%v, want %v", tc.when, tc.ask, tc.askFlag, prompted, tc.prompted)
+		}
+		answers, err := LoadAnswersFile(filepath.Join(dst, ".copier-answers.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, present := "bar", tc.when
+		if tc.prompted {
+			want = "barx"
+		}
+		if got, ok := answers["foo"]; ok != present || (present && got != want) {
+			t.Errorf("when=%v ask=%v --ask=%v: foo=%v (present %v), want %v (present %v)", tc.when, tc.ask, tc.askFlag, got, ok, want, present)
+		}
+	}
+}
+
+// TestUpdate_AskSetting ports upstream's test_update_with_ask_setting.
+func TestUpdate_AskSetting(t *testing.T) {
+	if !IsGitInstalled() {
+		t.Skip("git not installed")
+	}
+	for _, tc := range []struct {
+		when, ask, skipAnswered bool
+		askFlag                 []string
+		prompted                bool
+	}{
+		{true, true, false, nil, true},
+		{true, true, false, []string{"foo"}, true},
+		{true, true, false, []string{"baz"}, true},
+		{true, true, true, nil, false},
+		{true, true, true, []string{"foo"}, true},
+		{true, true, true, []string{"baz"}, false},
+		{true, false, false, nil, false},
+		{true, false, false, []string{"foo"}, true},
+		{true, false, false, []string{"baz"}, false},
+		{true, false, true, nil, false},
+		{true, false, true, []string{"foo"}, true},
+		{true, false, true, []string{"baz"}, false},
+		{false, true, false, nil, false},
+		{false, false, true, []string{"foo"}, false},
+	} {
+		src := askSettingTemplate(t, tc.when, tc.ask)
+		runGit(t, src, "init", "-q")
+		gitSave(t, src, "v1")
+		dst := t.TempDir()
+		if err := Copy(src, dst, WithQuiet(true), WithData(map[string]any{"foo": "prev"})); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, dst, "init", "-q")
+		gitSave(t, dst, "")
+
+		prompter := &scriptedPrompter{answers: map[string]any{"foo": "prevx"}}
+		if err := Update(dst, WithQuiet(true), WithPrompter(prompter), WithSkipAnswered(tc.skipAnswered), WithAsk(tc.askFlag...)); err != nil {
+			t.Fatal(err)
+		}
+		if prompted := len(prompter.asked) > 0; prompted != tc.prompted {
+			t.Errorf("when=%v ask=%v skip=%v --ask=%v: prompted=%v, want %v", tc.when, tc.ask, tc.skipAnswered, tc.askFlag, prompted, tc.prompted)
+		}
+		answers, err := LoadAnswersFile(filepath.Join(dst, ".copier-answers.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, present := "prev", tc.when
+		if tc.prompted {
+			want = "prevx"
+		}
+		if got, ok := answers["foo"]; ok != present || (present && got != want) {
+			t.Errorf("when=%v ask=%v skip=%v --ask=%v: foo=%v (present %v), want %v (present %v)", tc.when, tc.ask, tc.skipAnswered, tc.askFlag, got, ok, want, present)
+		}
+	}
+}
+
+// TestCopy_DestinationSymlinkOutsideDestinationRoot ports upstream's
+// test_destination_symlink_outside_destination_root.
+func TestCopy_DestinationSymlinkOutsideDestinationRoot(t *testing.T) {
+	for _, preserve := range []bool{true, false} {
+		src := t.TempDir()
+		dst := t.TempDir()
+		writeTree(t, src, map[string]string{
+			"copier.yaml": "_preserve_symlinks: " + strconv.FormatBool(preserve),
+			"file.txt":    "from template",
+		})
+		writeTree(t, dst, map[string]string{"other/target.txt": "external"})
+		project := filepath.Join(dst, "project")
+		if err := os.MkdirAll(project, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join("..", "other", "target.txt"), filepath.Join(project, "file.txt")); err != nil {
+			t.Fatal(err)
+		}
+		if err := Copy(src, project, WithQuiet(true), WithOverwrite(true)); err != nil {
+			t.Fatalf("preserve=%v: %v", preserve, err)
+		}
+		if isSymlinkPath(filepath.Join(project, "file.txt")) {
+			t.Fatalf("preserve=%v: destination symlink should be replaced", preserve)
+		}
+		if got := readFile(t, filepath.Join(project, "file.txt")); got != "from template" {
+			t.Fatalf("preserve=%v: unexpected content %q", preserve, got)
+		}
+		if got := readFile(t, filepath.Join(dst, "other", "target.txt")); got != "external" {
+			t.Fatalf("preserve=%v: symlink target modified: %q", preserve, got)
+		}
 	}
 }

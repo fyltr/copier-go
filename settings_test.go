@@ -25,6 +25,7 @@ func TestSettings_IsTrusted(t *testing.T) {
 	}
 }
 
+// TestIsTrustedRepository_Normalization ports upstream's test_is_trusted.
 func TestIsTrustedRepository_Normalization(t *testing.T) {
 	home, _ := os.UserHomeDir()
 	type tc struct {
@@ -34,40 +35,73 @@ func TestIsTrustedRepository_Normalization(t *testing.T) {
 	}
 	var cases []tc
 	for _, base := range []string{"https://github.com", "ssh://git@github.com", "git@github.com:", "gh:", "gl:"} {
-		sep := "/"
-		if base == "git@github.com:" || base == "gh:" || base == "gl:" {
-			sep = ""
-		}
+		b := base + "/"
 		cases = append(cases,
-			tc{base + sep + "user/repo.git", nil, false},
-			tc{base + sep + "user/repo.git", []string{base + sep + "user/repo.git"}, true},
-			tc{base + sep + "user/repo", []string{base + sep + "user/repo.git"}, false},
-			tc{base + sep + "user/repo.git", []string{base + sep + "user/"}, true},
-			tc{base + sep + "user/repo.git", []string{base + sep + "user/repo"}, false},
-			tc{base + sep + "user/repo.git", []string{base + sep + "user"}, false},
-			tc{base + sep + "user/../evil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/../evil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
-			tc{base + sep + "user/%2e%2e/evil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/%2E%2E/evil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/.%2e/evil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user%2f%2e%2e%2fevil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/%2e%2e/evil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
-			tc{base + sep + "user/%2e%2e%5cevil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/..%5cevil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/..\\evil/repo.git", []string{base + sep + "user/"}, false},
-			tc{base + sep + "user/%2e%2e%5cevil/repo.git", []string{base + sep + "user/../evil/repo.git"}, true},
+			// Plain URLs with no dot segments: normal prefix/equality matching.
+			tc{b + "user/repo.git", nil, false},
+			tc{b + "user/repo.git", []string{b + "user"}, false},
+			tc{b + "user/repo.git", []string{b + "user/"}, true},
+			tc{b + "user/repo.git", []string{b + "user/repo"}, false},
+			tc{b + "user/repo.git", []string{b + "user/repo.git"}, true},
+			tc{b + "user/repo.git", []string{b}, true},
+			tc{b + "user/repo.git", []string{base}, false},
+			tc{b + "user/repo", []string{b + "user/repo.git"}, false},
+			// Literal `..` traversal is collapsed, so a trusted prefix still
+			// matches (or not) as expected.
+			tc{b + "user/../evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/../evil/repo.git", []string{b + "user/../evil/repo.git"}, true},
+			tc{b + "x/../user/repo.git", []string{b + "user/"}, true},
+			// Ambiguous repository URLs (percent-encoding, backslashes, doubled
+			// slashes) never satisfy a trust prefix.
+			tc{b + "user/%2e%2e/evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/%2E%2E/evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/%2e%2E/evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/%2e./evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/.%2e/evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user%2f%2e%2e%2fevil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/%2e%2e%5cevil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/%2e%2e%5Cevil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user/..%5cevil/repo.git", []string{b + "user/"}, false},
+			tc{b + `user/..\evil/repo.git`, []string{b + "user/"}, false},
+			tc{b + "user%2fsub/../evil/repo.git", []string{b + "user/"}, false},
+			tc{b + "user%5csub/../evil/repo.git", []string{b + "user/"}, false},
+			tc{b + `user\sub/../evil/repo.git`, []string{b + "user/"}, false},
+			tc{b + "user%2fsub/../repo.git", []string{b + "user/repo.git"}, false},
+			tc{b + "x/%2e%2e/user/repo.git", []string{b + "user/"}, false},
+			tc{b + "x/%2E%2E/user/repo.git", []string{b + "user/"}, false},
+			tc{b + "attacker/repo/%2e%2e/%2e%2e/user/repo.git", []string{b + "user/"}, false},
+			tc{b + "attacker/evil/..//user/user", []string{b + "user/"}, false},
+			// An ambiguous repository can still be trusted via an exact,
+			// verbatim trust entry.
+			tc{b + "user/%2e%2e/evil/repo.git", []string{b + "user/%2e%2e/evil/repo.git"}, true},
+			tc{b + "user/%2e%2e/evil/repo.git", []string{b + "user/../evil/repo.git"}, false},
+			tc{b + "user/%2e%2e%5cevil/repo.git", []string{b + "user/%2e%2e%5cevil/repo.git"}, true},
+			tc{b + "user/%2e%2e%5cevil/repo.git", []string{b + `user/..\evil/repo.git`}, false},
+			tc{b + "user/%2e%2e%5cevil/repo.git", []string{b + "user/../evil/repo.git"}, false},
 		)
 	}
 	cases = append(cases,
+		// Local filesystem paths: normal prefix/equality matching, with `~`
+		// expansion and literal `..` traversal collapse.
+		tc{home + "/template", nil, false},
+		tc{home + "/template", []string{home + "/template"}, true},
+		tc{home + "/template", []string{"~/template"}, true},
+		tc{home + "/path/to/template", []string{"~/path/to/template"}, true},
+		tc{home + "/path/to/template", []string{"~/path/to/"}, true},
+		tc{home + "/path/to/template", []string{"~/path/to"}, false},
 		tc{home + "/trusted/../attacker/template", []string{home + "/trusted/"}, false},
 		tc{home + "/trusted/../attacker/template", []string{"~/trusted/"}, false},
+		// Percent-encoded segments are never decoded for local paths.
+		tc{home + "/user/%2e%2e/repo", []string{home + "/user/"}, true},
+		tc{home + "/user/%2e%2e/repo", []string{home + "/user/%2e%2e/repo"}, true},
+		tc{home + "/user/%2e%2e/repo", []string{home + "/user/repo"}, false},
 		tc{home + "/trusted/template", []string{"~/trusted/"}, true},
 		tc{"/tmp/tpl/", []string{"/tmp/tpl/"}, true},
 		tc{`C:\Users\me\tpl`, []string{`C:\Users\me\tpl`}, true},
 	)
 	for _, c := range cases {
 		if got := isTrustedRepository(c.trust, c.repo); got != c.want {
-			t.Errorf("isTrustedRepository(%v, %q) = %v, want %v (normalized %q)", c.trust, c.repo, got, c.want, normalizeTrustURL(c.repo))
+			t.Errorf("isTrustedRepository(%v, %q) = %v, want %v (safe %v, normalized %q)", c.trust, c.repo, got, c.want, isSafeTrustURL(c.repo), normalizeTrustURL(c.repo))
 		}
 	}
 }

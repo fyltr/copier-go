@@ -645,6 +645,17 @@ func (w *worker) matchesAsk(name string) bool {
 	return false
 }
 
+// questionError attributes err to a question. Validation and invalid-choice
+// errors already name the question, so they are returned as is, like upstream.
+func questionError(name string, err error) error {
+	var ve *ValidationError
+	var ce *InvalidChoiceError
+	if errors.As(err, &ve) || errors.As(err, &ce) {
+		return err
+	}
+	return &QuestionError{Name: name, Err: err}
+}
+
 // ask runs the questionnaire and records the answers.
 func (w *worker) ask() error {
 	w.answers = NewAnswersMap()
@@ -676,9 +687,13 @@ func (w *worker) ask() error {
 			}
 		}
 
+		ask, err := q.AskCondition()
+		if err != nil {
+			return questionError(name, err)
+		}
 		when, err := q.When()
 		if err != nil {
-			return &QuestionError{Name: name, Err: err}
+			return questionError(name, err)
 		}
 		var computedDefault any
 		if !when {
@@ -687,7 +702,7 @@ func (w *worker) ask() error {
 			delete(w.answers.Last, name)
 			def, present, err := q.Default()
 			if err != nil {
-				return &QuestionError{Name: name, Err: err}
+				return questionError(name, err)
 			}
 			if !present {
 				continue
@@ -697,9 +712,10 @@ func (w *worker) ask() error {
 
 		if !w.matchesAsk(name) {
 			if v, ok := w.answers.Init[name]; ok {
+				// Answers given as data are parsed and validated like prompted ones.
 				answer, err := q.ParseAnswer(v)
 				if err != nil {
-					return &QuestionError{Name: name, Err: err}
+					return questionError(name, err)
 				}
 				if err := q.ValidateAnswer(answer); err != nil {
 					return err
@@ -707,15 +723,27 @@ func (w *worker) ask() error {
 				w.answers.User[name] = answer
 				continue
 			}
-			if w.cfg.SkipAnswered {
-				if _, ok := w.answers.Last[name]; ok {
-					continue
-				}
+			if _, ok := w.answers.Last[name]; ok && (w.cfg.SkipAnswered || !ask) {
+				continue
 			}
-			if w.cfg.Defaults {
+			if !ask {
+				// Not prompted (`ask: false`) and no previous answer: use the
+				// default, if any.
 				def, present, err := q.Default()
 				if err != nil {
-					return &QuestionError{Name: name, Err: err}
+					return questionError(name, err)
+				}
+				if present {
+					w.answers.User[name] = def
+				}
+				continue
+			}
+			if w.cfg.Defaults {
+				// Default validates the value unless `when` is false or the
+				// question is secret.
+				def, present, err := q.Default()
+				if err != nil {
+					return questionError(name, err)
 				}
 				if !present {
 					return &QuestionError{Name: name, Err: ErrQuestionRequired}
@@ -735,7 +763,7 @@ func (w *worker) ask() error {
 			if errors.Is(err, ErrInteractiveNeeded) {
 				return &QuestionError{Name: name, Err: fmt.Errorf("%w: use `--defaults` and/or `--data`/`--data-file`", ErrInteractiveNeeded)}
 			}
-			return &QuestionError{Name: name, Err: err}
+			return questionError(name, err)
 		}
 		w.answers.User[name] = answer
 	}
@@ -1045,7 +1073,9 @@ func (w *worker) renderTemplate() error {
 			for _, rp := range rendered {
 				dstPath := filepath.Join(dstRoot, rp.Path)
 				var dstReal string
-				if preserve && isSymlinkPath(dstPath) {
+				if isSymlinkPath(dstPath) {
+					// A destination symlink may point outside the subproject while
+					// itself existing within it, so do not resolve the link itself.
 					parent, err := pathutil.Resolve(filepath.Dir(dstPath))
 					if err != nil {
 						return err

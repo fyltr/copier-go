@@ -172,6 +172,9 @@ func newQuestion(def QuestionDef, answers *AnswersMap, settings *Settings, rende
 	if def.When == nil {
 		def.When = true
 	}
+	if def.Ask == nil {
+		def.Ask = true
+	}
 	return &Question{Def: def, answers: answers, settings: settings, renderer: renderer, ctx: ctx}
 }
 
@@ -739,9 +742,21 @@ func (q *Question) ValidateAnswer(answer any) error {
 	return nil
 }
 
-// When evaluates the skip condition of the question.
+// When evaluates the skip condition of the question. A false condition skips
+// the question and discards its previous answer.
 func (q *Question) When() (bool, error) {
 	rendered, err := q.renderValue(q.Def.When, nil)
+	if err != nil {
+		return false, err
+	}
+	return castToBool(rendered), nil
+}
+
+// AskCondition evaluates the `ask` setting of the question. A false condition
+// does not prompt the question unless it is requested with `--ask`; its
+// previous answer, or else its default, is used instead.
+func (q *Question) AskCondition() (bool, error) {
+	rendered, err := q.renderValue(q.Def.Ask, nil)
 	if err != nil {
 		return false, err
 	}

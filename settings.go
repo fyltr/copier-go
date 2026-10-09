@@ -55,7 +55,8 @@ func settingsPath() string {
 
 // IsTrusted checks whether repo matches any entry in the trust list.
 // An entry matches exactly, or as a prefix if it ends with "/". Both sides are
-// normalized first so that encoded or traversing paths cannot bypass a prefix.
+// normalized first, and only unambiguous URLs (see isSafeTrustURL) are
+// normalized; any other URL is trusted only by an exact, verbatim entry.
 func (s *Settings) IsTrusted(repo string) bool {
 	if s == nil {
 		return false
@@ -73,13 +74,22 @@ func (s *Settings) DefaultFor(name string) (any, bool) {
 }
 
 func isTrustedRepository(trust []string, repo string) bool {
+	repoIsSafe := isSafeTrustURL(repo)
 	normalized := normalizeTrustURL(repo)
 	for _, t := range trust {
-		if strings.HasSuffix(t, "/") {
-			if strings.HasPrefix(normalized, normalizeTrustURL(t)) {
+		switch {
+		case repoIsSafe && isSafeTrustURL(t):
+			if strings.HasSuffix(t, "/") {
+				// Safe prefix: trust anything nested under it.
+				if strings.HasPrefix(normalized, normalizeTrustURL(t)) {
+					return true
+				}
+			} else if normalized == normalizeTrustURL(t) {
+				// Safe exact: trust only the exact normalized match.
 				return true
 			}
-		} else if normalized == normalizeTrustURL(t) {
+		case repo == t:
+			// Unsafe: trust only an exact raw match.
 			return true
 		}
 	}
@@ -89,9 +99,88 @@ func isTrustedRepository(trust []string, repo string) bool {
 // scpURLRe matches Git's SCP-like syntax: [user@]host:path
 var scpURLRe = regexp.MustCompile(`^(?:[^/@:\s]+@)?[^/:\s]+:.+$`)
 
-// normalizeTrustURL mirrors upstream Copier's `_normalize` for trust checks.
+// safeURLPathSegmentRe matches RFC 3986 §2.3 "unreserved" characters: letters,
+// digits, `-`, `.`, `_`, `~`.
+var safeURLPathSegmentRe = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+
+// isURLStyle reports whether u is an absolute URL or uses an alias prefix.
+func isURLStyle(u string) bool {
+	return strings.Contains(u, "://") || hasAliasPrefix(u)
+}
+
+// isSCPStyle reports whether u uses Git's SCP-like syntax ([user@]host:path).
+func isSCPStyle(u string) bool {
+	return !isWindowsAbsPath(u) && scpURLRe.MatchString(u)
+}
+
+// isSafeTrustURL mirrors upstream Copier's `_is_safe_url`: local paths are
+// always safe, and remote references are safe when every path segment consists
+// only of RFC 3986 "unreserved" characters. Any other character (percent
+// encoding, backslashes, doubled slashes) may be resolved differently by a Git
+// transport or server than by the trust check.
+func isSafeTrustURL(u string) bool {
+	var p string
+	switch {
+	case isURLStyle(u):
+		p = urlSplitPath(u)
+	case isSCPStyle(u):
+		_, p, _ = strings.Cut(u, ":")
+	default:
+		return true
+	}
+	segments := strings.Split(p, "/")
+	if len(segments) > 0 && segments[0] == "" {
+		segments = segments[1:]
+	}
+	if len(segments) > 0 && segments[len(segments)-1] == "" {
+		segments = segments[:len(segments)-1]
+	}
+	for _, segment := range segments {
+		if !safeURLPathSegmentRe.MatchString(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+// urlSplitPath returns the raw (still percent-encoded) path of u, like the
+// path component of Python's urllib.parse.urlsplit.
+func urlSplitPath(u string) string {
+	rest := u
+	if i := strings.IndexByte(rest, ':'); i > 0 && isURLScheme(rest[:i]) {
+		rest = rest[i+1:]
+	}
+	if strings.HasPrefix(rest, "//") {
+		rest = rest[2:]
+		i := strings.IndexAny(rest, "/?#")
+		if i < 0 {
+			return ""
+		}
+		rest = rest[i:]
+	}
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+func isURLScheme(s string) bool {
+	for i, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '+' || c == '-' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return s != ""
+}
+
+// normalizeTrustURL mirrors upstream Copier's `_normalize` for trust checks:
+// dot segments of URL and SCP-style paths are resolved with POSIX semantics,
+// and local paths get `~` expanded and are cleaned with OS semantics.
 func normalizeTrustURL(u string) string {
-	if strings.Contains(u, "://") || hasAliasPrefix(u) {
+	if isURLStyle(u) {
 		parsed, err := url.Parse(u)
 		if err == nil {
 			if parsed.Opaque != "" || (parsed.Host == "" && !strings.Contains(u, "://")) {
@@ -124,7 +213,7 @@ func normalizeTrustURL(u string) string {
 		}
 	}
 
-	if !isWindowsAbsPath(u) && scpURLRe.MatchString(u) {
+	if isSCPStyle(u) {
 		host, p, _ := strings.Cut(u, ":")
 		return host + ":" + normalizeURLPath(p)
 	}
@@ -160,19 +249,14 @@ func isWindowsAbsPath(p string) bool {
 	return strings.HasPrefix(p, `\\`)
 }
 
-// normalizeURLPath percent-decodes, folds backslashes to slashes and
-// collapses dot segments so encoded traversal cannot bypass a trust prefix.
+// normalizeURLPath resolves `.`/`..` segments and collapses redundant `/` in
+// p. This uses POSIX path semantics, not RFC 3986 path normalization.
 func normalizeURLPath(p string) string {
-	decoded := p
-	if d, err := url.PathUnescape(p); err == nil {
-		decoded = d
+	if p == "" {
+		return p
 	}
-	decoded = strings.ReplaceAll(decoded, "\\", "/")
-	if decoded == "" {
-		return decoded
-	}
-	out := path.Clean(decoded)
-	if strings.HasSuffix(decoded, "/") && !strings.HasSuffix(out, "/") {
+	out := path.Clean(p)
+	if strings.HasSuffix(p, "/") && !strings.HasSuffix(out, "/") {
 		out += "/"
 	}
 	return out
