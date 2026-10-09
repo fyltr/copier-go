@@ -132,10 +132,13 @@ func (r *Renderer) wrapRenderError(prefix string, err error) error {
 	return &renderError{msg: prefix + ": " + err.Error(), cause: cause}
 }
 
-// sandboxLoader is a pongo2 loader confined to the template root.
+// sandboxLoader is a pongo2 loader confined to the template root, or to the
+// wider include root set with WithIncludeRoot. Relative names always resolve
+// against the template root.
 type sandboxLoader struct {
-	root    string
-	lastErr error // Last forbidden-path error, surfaced when pongo2 swallows it.
+	base    string // Template root, which relative names resolve against.
+	root    string // Sandbox boundary: the template root or the include root.
+	lastErr error  // Last forbidden-path error, surfaced when pongo2 swallows it.
 }
 
 func (l *sandboxLoader) Abs(base, name string) string {
@@ -149,19 +152,23 @@ func (l *sandboxLoader) Abs(base, name string) string {
 }
 
 func (l *sandboxLoader) Get(name string) (io.Reader, error) {
-	if l.root == "" {
+	if l.base == "" {
 		return nil, fmt.Errorf("%w: template includes are not available without a template root", ErrForbiddenPath)
 	}
 	target := name
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(l.root, filepath.FromSlash(name))
+		target = filepath.Join(l.base, filepath.FromSlash(name))
 	}
 	ok, err := pathutil.IsWithin(l.root, target)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		l.lastErr = fmt.Errorf("%w: %s is outside the template root", ErrForbiddenPath, name)
+		boundary := "template root"
+		if l.root != l.base {
+			boundary = "include root"
+		}
+		l.lastErr = fmt.Errorf("%w: %s is outside the %s", ErrForbiddenPath, name, boundary)
 		return nil, l.lastErr
 	}
 	data, err := os.ReadFile(target)
@@ -180,7 +187,7 @@ func NewRenderer(baseCtx map[string]any, templateRoot string, envops ...Envops) 
 			root = resolved
 		}
 	}
-	loader := &sandboxLoader{root: root}
+	loader := &sandboxLoader{base: root, root: root}
 	tplSet := pongo2.NewSet("copier", loader)
 	tplSet.Debug = false
 
@@ -203,6 +210,27 @@ func NewRenderer(baseCtx map[string]any, templateRoot string, envops ...Envops) 
 		strictUndefined: eo.Undefined == "jinja2.StrictUndefined",
 		root:            root,
 	}
+}
+
+// setIncludeRoot widens the include sandbox to dir, which must contain the
+// template root. Relative include names still resolve against the template root.
+func (r *Renderer) setIncludeRoot(dir string) error {
+	if r.loader.base == "" {
+		return fmt.Errorf("%w: an include root requires a template root", ErrForbiddenPath)
+	}
+	root, err := pathutil.Resolve(dir)
+	if err != nil {
+		return err
+	}
+	ok, err := pathutil.IsWithin(root, r.loader.base)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("%w: include root %s does not contain the template root %s", ErrForbiddenPath, dir, r.loader.base)
+	}
+	r.loader.root = root
+	return nil
 }
 
 // RenderString renders a template string with the given extra context.

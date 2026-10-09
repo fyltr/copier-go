@@ -68,6 +68,11 @@ type Config struct {
 
 	// Prompter overrides the interactive prompter (defaults to the terminal UI).
 	Prompter Prompter
+
+	// IncludeRoot widens the sandbox of `{% include %}`, `{% import %}` and
+	// `{% extends %}` from the template root to this directory, which must
+	// contain the template root. Empty means the template root.
+	IncludeRoot string
 }
 
 func defaultConfig() Config {
@@ -148,3 +153,11 @@ func WithContextLines(n int) Option { return func(c *Config) { c.ContextLines = 
 
 // WithPrompter sets a custom Prompter, e.g. for embedding or tests.
 func WithPrompter(p Prompter) Option { return func(c *Config) { c.Prompter = p } }
+
+// WithIncludeRoot sets the directory that `{% include %}`, `{% import %}` and
+// `{% extends %}` may read from. Names still resolve against the template root,
+// but the sandbox boundary is dir, which must contain the template root. A
+// relative dir is resolved against the current working directory. Templates
+// relying on it do not render with upstream Copier, whose loader is confined to
+// the template root.
+func WithIncludeRoot(dir string) Option { return func(c *Config) { c.IncludeRoot = dir } }

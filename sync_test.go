@@ -1129,3 +1129,43 @@ func TestCopy_MinCopierVersion(t *testing.T) {
 		}
 	}
 }
+
+// WithIncludeRoot widens the include sandbox: names still resolve against the
+// template root, so "../../_shared/x" from stacks/dev reaches <root>/_shared.
+func TestCopy_WithIncludeRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "templates")
+	writeTree(t, root, map[string]string{
+		"stacks/dev/copier.yml":      "name:\n    type: str\n    default: dev\n",
+		"stacks/dev/AGENTS.md.jinja": `{% include "../../_shared/AGENTS.md.jinja" with restart_job="deps" %}`,
+		"_shared/AGENTS.md.jinja":    "{{ name }} restarts {{ restart_job }}",
+	})
+	src := filepath.Join(root, "stacks", "dev")
+
+	err := Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true))
+	if !errors.Is(err, ErrForbiddenPath) {
+		t.Fatalf("include outside the template root should be forbidden, got %v", err)
+	}
+
+	dst := t.TempDir()
+	if err := Copy(src, dst, WithQuiet(true), WithDefaults(true), WithIncludeRoot(root)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(dst, "AGENTS.md")); got != "dev restarts deps" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+
+	// The include root must contain the template root.
+	err = Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true), WithIncludeRoot(filepath.Join(root, "_shared")))
+	if !errors.Is(err, ErrForbiddenPath) {
+		t.Fatalf("include root not containing the template should be rejected, got %v", err)
+	}
+
+	// The include root is still a sandbox.
+	writeTree(t, root, map[string]string{"stacks/dev/AGENTS.md.jinja": `{% include "../../../escape.txt" %}`})
+	writeTree(t, base, map[string]string{"escape.txt": "outside"})
+	err = Copy(src, t.TempDir(), WithQuiet(true), WithDefaults(true), WithIncludeRoot(root))
+	if !errors.Is(err, ErrForbiddenPath) {
+		t.Fatalf("include outside the include root should be forbidden, got %v", err)
+	}
+}

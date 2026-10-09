@@ -86,7 +86,11 @@ func (w *worker) subWorker(tmpl *Template, dst string, cfg Config) (*worker, err
 		logger:    w.logger,
 		dstAbs:    dstAbs,
 	}
-	sw.renderer = NewRenderer(nil, tmpl.LocalPath, tmpl.Config.Envops)
+	renderer, err := sw.newRenderer(tmpl)
+	if err != nil {
+		return nil, err
+	}
+	sw.renderer = renderer
 	return sw, nil
 }
 
@@ -143,8 +147,24 @@ func (w *worker) ensureTemplate(src, ref string) error {
 	}
 	w.tmpl = tmpl
 	w.ownsTemplate = true
-	w.renderer = NewRenderer(nil, tmpl.LocalPath, tmpl.Config.Envops)
+	renderer, err := w.newRenderer(tmpl)
+	if err != nil {
+		return err
+	}
+	w.renderer = renderer
 	return nil
+}
+
+// newRenderer creates the renderer for tmpl, with the include sandbox widened
+// to the WithIncludeRoot directory when one is set.
+func (w *worker) newRenderer(tmpl *Template) (*Renderer, error) {
+	r := NewRenderer(nil, tmpl.LocalPath, tmpl.Config.Envops)
+	if w.cfg.IncludeRoot != "" {
+		if err := r.setIncludeRoot(w.cfg.IncludeRoot); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
 }
 
 func (w *worker) cleanupTemplate() {
